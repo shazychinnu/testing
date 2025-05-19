@@ -1,79 +1,225 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import messagebox, filedialog
 import threading
+import os
 from backend import perform_operation
 
-# Function to browse directory
-def browse_directory(username, password, log_area, path_label):
-    if username.strip() == "" or username.strip().lower() == "username" or password.strip() == "" or password.strip().lower() == "password":
-        messagebox.showerror("Error", "Username or Password cannot be empty!")
-        return
+class MacroToolApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Macro Automation Dashboard")
+        self.root.geometry("750x480")
+        self.root.resizable(False, False)
 
-    directory = filedialog.askdirectory()
-    if directory:
-        display_path(directory, path_label)
-        threading.Thread(target=perform_operation, args=(directory, lambda msg: update_log(log_area, msg))).start()
+        self.light_theme = {
+            "bg": "#F9FAFB",
+            "fg": "#111827",
+            "entry_bg": "#FFFFFF",
+            "box_bg": "#F3F4F6",
+            "box_fg": "#111827",
+            "success": "#22C55E",
+            "error": "#EF4444",
+            "running": "#FBBF24",
+            "button_bg": "#6366F1",
+            "button_hover": "#4F46E5"
+        }
 
-# Function to update log widget
-def update_log(log_widget, message):
-    log_widget.insert(tk.END, message)
-    log_widget.see(tk.END)
+        self.dark_theme = {
+            "bg": "#1E1E2E",
+            "fg": "#E5E7EB",
+            "entry_bg": "#2A2A3B",
+            "box_bg": "#2D2D44",
+            "box_fg": "#E5E7EB",
+            "success": "#10B981",
+            "error": "#EF4444",
+            "running": "#F59E0B",
+            "button_bg": "#3B82F6",
+            "button_hover": "#2563EB"
+        }
 
-# Function to display path properly
-def display_path(directory, path_label):
-    formatted_path = "\n".join([directory[i:i+50] for i in range(0, len(directory), 50)])
-    path_label.config(text=f"Selected Path:\n{formatted_path}")
+        self.theme = self.light_theme
+        self.font = ("Segoe UI", 10)
+        self.header_font = ("Segoe UI", 13, "bold")
+        self.log_font = ("Consolas", 9)
+        self.status_lines = []
+        self.status_dict = {}
+        self.directory = ""
+        self.lock = threading.Lock()
 
-# Main window setup
-def main():
-    window = tk.Tk()
-    window.title("Login and Logs")
-    window.geometry("700x450")
-    window.config(bg="#0F172A")
-    window.resizable(False, False)
+        self.setup_ui()
 
-    # Top frame for path display
-    top_frame = tk.Frame(window, bg="#0F172A")
-    top_frame.pack(side=tk.TOP, fill=tk.X)
+    def setup_ui(self):
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
 
-    path_label = tk.Label(top_frame, text="", font=("Poppins", 10, "bold"), bg="#0F172A", fg="#22D3EE", wraplength=680, justify="left")
-    path_label.pack(padx=10, pady=5)
+        self.paned = tk.PanedWindow(self.main_frame, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True)
 
-    # Main frames
-    main_frame = tk.Frame(window, bg="#0F172A")
-    main_frame.pack(fill=tk.BOTH, expand=True)
+        self.left_panel = tk.Frame(self.paned)
+        self.right_panel = tk.Frame(self.paned)
+        self.paned.add(self.left_panel)
+        self.paned.add(self.right_panel)
 
-    left_frame = tk.Frame(main_frame, bg="#0F172A", width=350, height=450)
-    left_frame.pack(side=tk.LEFT, fill=tk.Y)
+        self.build_left_panel()
+        self.build_right_panel()
+        self.apply_theme()
 
-    right_frame = tk.Frame(main_frame, bg="#0F172A", width=350, height=450)
-    right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+    def build_left_panel(self):
+        self.title_label = tk.Label(self.left_panel, text="📊 Macro Tracker", font=self.header_font)
+        self.title_label.pack(pady=(10, 5))
 
-    # Title
-    title_label = tk.Label(left_frame, text="MCH Credentials", font=("Poppins", 16, "bold"), bg="#0F172A", fg="#F8FAFC")
-    title_label.pack(pady=20)
+        login_frame = tk.Frame(self.left_panel)
+        login_frame.pack(pady=5)
+        tk.Label(login_frame, text="Username", font=self.font).grid(row=0, column=0, padx=5)
+        self.username = tk.Entry(login_frame, font=self.font)
+        self.username.grid(row=0, column=1)
+        tk.Label(login_frame, text="Password", font=self.font).grid(row=0, column=2, padx=5)
+        self.password = tk.Entry(login_frame, show="*", font=self.font)
+        self.password.grid(row=0, column=3)
 
-    # Username Entry
-    username_entry = tk.Entry(left_frame, font=("Poppins", 10), bd=0, bg="#1E293B", fg="#F8FAFC", insertbackground="#F8FAFC", width=24)
-    username_entry.insert(0, "Username")
-    username_entry.pack(pady=8, ipady=6)
+        control_frame = tk.Frame(self.left_panel)
+        control_frame.pack(pady=10)
+        self.start_btn = self.make_button(control_frame, "▶ Start", self.start_macros)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        self.clear_btn = self.make_button(control_frame, "🧹 Clear", self.clear_logs)
+        self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self.refresh_btn = self.make_button(control_frame, "🔄 Refresh", self.refresh_status)
+        self.refresh_btn.pack(side=tk.LEFT, padx=5)
 
-    # Password Entry
-    password_entry = tk.Entry(left_frame, font=("Poppins", 10), bd=0, bg="#1E293B", fg="#F8FAFC", insertbackground="#F8FAFC", width=24, show="*")
-    password_entry.insert(0, "Password")
-    password_entry.pack(pady=8, ipady=6)
+        canvas = tk.Canvas(self.left_panel, highlightthickness=0)
+        scrollbar = tk.Scrollbar(self.left_panel, orient="vertical", command=canvas.yview)
+        self.table_frame = tk.Frame(canvas)
 
-    # Login Button
-    login_button = tk.Button(left_frame, text="LOGIN", font=("Poppins", 9, "bold"), bg="#38BDF8", fg="#0F172A", width=22, pady=6,
-                              activebackground="#0EA5E9", activeforeground="#FFFFFF",
-                              command=lambda: browse_directory(username_entry.get(), password_entry.get(), log_area, path_label))
-    login_button.pack(pady=10)
+        self.table_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.table_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
-    # Logs Area
-    log_area = scrolledtext.ScrolledText(right_frame, font=("Consolas", 9), bg="#0F172A", fg="#F8FAFC")
-    log_area.pack(padx=8, pady=8, fill=tk.BOTH, expand=True)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    window.mainloop()
+        self.status_label = tk.Label(self.left_panel, font=self.font)
+        self.status_label.pack(pady=(5, 10))
+
+    def build_right_panel(self):
+        self.log_title = tk.Label(self.right_panel, text="Macro Logs", font=self.header_font)
+        self.log_title.pack(pady=20)
+
+        log_frame = tk.Frame(self.right_panel)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scrollbar = tk.Scrollbar(log_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.log_view = tk.Text(log_frame, wrap="word", font=self.log_font, yscrollcommand=scrollbar.set)
+        self.log_view.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.log_view.yview)
+        self.log_view.config(state=tk.DISABLED)
+
+
+    def apply_theme(self):
+        widgets = [self.root, self.main_frame, self.left_panel, self.right_panel, self.table_frame,
+                   self.status_label, self.title_label, self.log_title]
+        for widget in widgets:
+            widget.configure(bg=self.theme["bg"])
+        for entry in [self.username, self.password]:
+            entry.configure(bg=self.theme["entry_bg"], fg=self.theme["fg"], insertbackground=self.theme["fg"])
+        self.log_view.configure(bg=self.theme["box_bg"], fg=self.theme["box_fg"])
+        self.render_table()
+
+    def make_button(self, parent, text, command):
+        return tk.Button(parent, text=text, command=command, font=self.font,
+                         bg=self.theme["button_bg"], fg="#FFFFFF",
+                         activebackground=self.theme["button_hover"], relief=tk.FLAT, bd=0, width=10)
+
+    def start_macros(self):
+        user = self.username.get()
+        pwd = self.password.get()
+        if not user or not pwd:
+            messagebox.showerror("Error", "Username and Password required")
+            return
+
+        directory = filedialog.askdirectory()
+        if not directory:
+            return
+
+        self.directory = directory
+        macro_files = [f for f in os.listdir(directory) if f.lower().endswith((".xlsm", ".pdf", ".docx"))]
+        if not macro_files:
+            messagebox.showinfo("Info", "No .xlsm files found in the selected directory.")
+            return
+
+        display_names = [os.path.splitext(f)[0] for f in macro_files]
+        self.status_dict = {name: "Pending" for name in display_names}
+        self.status_lines = [[name, "Pending"] for name in display_names]
+        self.render_table()
+        self.clear_logs()
+        self.start_btn.config(state=tk.DISABLED)
+
+        for original_file, display_name in zip(macro_files, display_names):
+            full_path = os.path.join(directory, original_file)
+            threading.Thread(target=self.run_macro_thread, args=(display_name, full_path), daemon=True).start()
+
+    def run_macro_thread(self, macro_name, file_path):
+        self.update_status(macro_name, "Running...")
+        perform_operation(file_path, lambda msg: self.add_log(macro_name, msg))
+        self.update_status(macro_name, "Completed")
+        if all(status == "Completed" for status in self.status_dict.values()):
+            self.finish()
+
+    def update_status(self, macro_name, status):
+        with self.lock:
+            self.status_dict[macro_name] = status
+            self.status_lines = [[k, self.status_dict[k]] for k in self.status_dict]
+        self.root.after(0, self.render_table)
+
+    def render_table(self):
+        for w in self.table_frame.winfo_children():
+            w.destroy()
+        for i, (macro, status) in enumerate(self.status_lines):
+            tk.Label(self.table_frame, text=macro, width=30, anchor="w", font=self.font,
+                     bg=self.theme["entry_bg"], fg=self.theme["fg"]).grid(row=i, column=0, padx=2, pady=2)
+            color = self.theme["success"] if "Completed" in status else self.theme["running"] if "Running" in status else self.theme["fg"]
+            tk.Label(self.table_frame, text=status, width=15, anchor="w", font=self.font,
+                     bg=self.theme["entry_bg"], fg=color).grid(row=i, column=1, padx=2, pady=2)
+
+    def add_log(self, macro, msg):
+        self.root.after(0, lambda: self.show_log(macro, msg))
+
+    def show_log(self, macro, msg):
+        self.log_view.config(state=tk.NORMAL)
+        self.log_view.insert(tk.END, f"{macro}: {msg}\n")
+        self.log_view.see(tk.END)
+        self.log_view.config(state=tk.DISABLED)
+
+    def clear_logs(self):
+        self.status_lines.clear()
+        self.status_dict.clear()
+        self.render_table()
+        self.log_view.config(state=tk.NORMAL)
+        self.log_view.delete("1.0", tk.END)
+        self.log_view.config(state=tk.DISABLED)
+        self.status_label.config(text="")
+
+    def refresh_status(self):
+        for key in self.status_dict:
+            self.status_dict[key] = "Pending"
+        self.status_lines = [[k, "Pending"] for k in self.status_dict]
+        self.render_table()
+        self.status_label.config(text="Table refreshed.")
+
+    def finish(self):
+        self.start_btn.config(state=tk.NORMAL)
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.config(bg="#ECFDF5")
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 120
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 30
+        toast.geometry(f"240x60+{x}+{y}")
+        tk.Label(toast, text="✅ All macros completed!", bg="#ECFDF5", fg="#047857",
+                 font=("Segoe UI", 10, "bold")).pack(expand=True)
+        toast.after(3000, toast.destroy)
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = MacroToolApp(root)
+    root.mainloop()
