@@ -17,11 +17,15 @@ class MacroToolApp:
             "entry_bg": "#FFFFFF",
             "box_bg": "#F3F4F6",
             "box_fg": "#111827",
+            "header_fg": "#111827",
             "success": "#22C55E",
             "error": "#EF4444",
             "running": "#FBBF24",
-            "button_bg": "#6366F1",
-            "button_hover": "#4F46E5"
+            "start_btn": "#4ADE80",
+            "clear_btn": "#F87171",
+            "refresh_btn": "#60A5FA",
+            "theme_btn": "#FBBF24",
+            "button_hover": "#4B5563"
         }
 
         self.dark_theme = {
@@ -30,14 +34,18 @@ class MacroToolApp:
             "entry_bg": "#2A2A3B",
             "box_bg": "#2D2D44",
             "box_fg": "#E5E7EB",
+            "header_fg": "#FFFFFF",
             "success": "#10B981",
             "error": "#EF4444",
             "running": "#F59E0B",
-            "button_bg": "#3B82F6",
+            "start_btn": "#22C55E",
+            "clear_btn": "#EF4444",
+            "refresh_btn": "#3B82F6",
+            "theme_btn": "#F59E0B",
             "button_hover": "#2563EB"
         }
 
-        self.theme = self.light_theme
+        self.theme = self.dark_theme
         self.font = ("Segoe UI", 10)
         self.header_font = ("Segoe UI", 13, "bold")
         self.log_font = ("Consolas", 9)
@@ -70,6 +78,7 @@ class MacroToolApp:
 
         login_frame = tk.Frame(self.left_panel)
         login_frame.pack(pady=5)
+        self.login_frame = login_frame
         tk.Label(login_frame, text="Username", font=self.font).grid(row=0, column=0, padx=5)
         self.username = tk.Entry(login_frame, font=self.font)
         self.username.grid(row=0, column=1)
@@ -79,14 +88,18 @@ class MacroToolApp:
 
         control_frame = tk.Frame(self.left_panel)
         control_frame.pack(pady=10)
-        self.start_btn = self.make_button(control_frame, "▶ Start", self.start_macros)
+        self.control_frame = control_frame
+        self.start_btn = self.make_button(control_frame, "▶ Start", self.start_macros, "start_btn")
         self.start_btn.pack(side=tk.LEFT, padx=5)
-        self.clear_btn = self.make_button(control_frame, "🧹 Clear", self.clear_logs)
+        self.clear_btn = self.make_button(control_frame, "🧹 Clear", self.clear_logs, "clear_btn")
         self.clear_btn.pack(side=tk.LEFT, padx=5)
-        self.refresh_btn = self.make_button(control_frame, "🔄 Refresh", self.refresh_status)
+        self.refresh_btn = self.make_button(control_frame, "🔄 Refresh", self.refresh_status, "refresh_btn")
         self.refresh_btn.pack(side=tk.LEFT, padx=5)
+        self.theme_btn = self.make_button(control_frame, "🌚 Theme", self.toggle_theme, "theme_btn")
+        self.theme_btn.pack(side=tk.LEFT, padx=5)
 
         canvas = tk.Canvas(self.left_panel, highlightthickness=0)
+        self.table_canvas = canvas
         scrollbar = tk.Scrollbar(self.left_panel, orient="vertical", command=canvas.yview)
         self.table_frame = tk.Frame(canvas)
 
@@ -106,6 +119,7 @@ class MacroToolApp:
 
         log_frame = tk.Frame(self.right_panel)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_frame = log_frame
         scrollbar = tk.Scrollbar(log_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -114,20 +128,38 @@ class MacroToolApp:
         scrollbar.config(command=self.log_view.yview)
         self.log_view.config(state=tk.DISABLED)
 
-
     def apply_theme(self):
-        widgets = [self.root, self.main_frame, self.left_panel, self.right_panel, self.table_frame,
-                   self.status_label, self.title_label, self.log_title]
+        widgets = [self.root, self.main_frame, self.left_panel, self.right_panel,
+                   self.table_frame, self.login_frame, self.control_frame,
+                   self.status_label, self.log_frame, self.table_canvas]
         for widget in widgets:
             widget.configure(bg=self.theme["bg"])
+
+        for label in self.login_frame.winfo_children():
+            if isinstance(label, tk.Label):
+                label.configure(bg=self.theme["bg"], fg=self.theme["fg"])
+
         for entry in [self.username, self.password]:
             entry.configure(bg=self.theme["entry_bg"], fg=self.theme["fg"], insertbackground=self.theme["fg"])
+
+        self.title_label.configure(bg=self.theme["bg"], fg=self.theme["header_fg"])
+        self.log_title.configure(bg=self.theme["bg"], fg=self.theme["header_fg"])
         self.log_view.configure(bg=self.theme["box_bg"], fg=self.theme["box_fg"])
+
+        self.start_btn.configure(bg=self.theme["start_btn"], activebackground=self.theme["button_hover"])
+        self.clear_btn.configure(bg=self.theme["clear_btn"], activebackground=self.theme["button_hover"])
+        self.refresh_btn.configure(bg=self.theme["refresh_btn"], activebackground=self.theme["button_hover"])
+        self.theme_btn.configure(bg=self.theme["theme_btn"], activebackground=self.theme["button_hover"])
+
         self.render_table()
 
-    def make_button(self, parent, text, command):
+    def toggle_theme(self):
+        self.theme = self.light_theme if self.theme == self.dark_theme else self.dark_theme
+        self.apply_theme()
+
+    def make_button(self, parent, text, command, theme_key):
         return tk.Button(parent, text=text, command=command, font=self.font,
-                         bg=self.theme["button_bg"], fg="#FFFFFF",
+                         bg=self.theme[theme_key], fg="#FFFFFF",
                          activebackground=self.theme["button_hover"], relief=tk.FLAT, bd=0, width=10)
 
     def start_macros(self):
