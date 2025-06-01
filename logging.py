@@ -93,8 +93,7 @@ class MacroToolApp:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = self.make_button(control_frame, "🧹 Clear", self.clear_logs, "clear_btn")
         self.clear_btn.pack(side=tk.LEFT, padx=5)
-        self.refresh_btn = self.make_button(control_frame, "🔄 Refresh", self.refresh_status, "refresh_btn")
-        self.refresh_btn.pack(side=tk.LEFT, padx=5)
+        # Removed refresh button as per your earlier request
         self.theme_btn = self.make_button(control_frame, "🌚 Theme", self.toggle_theme, "theme_btn")
         self.theme_btn.pack(side=tk.LEFT, padx=5)
 
@@ -148,7 +147,6 @@ class MacroToolApp:
 
         self.start_btn.configure(bg=self.theme["start_btn"], activebackground=self.theme["button_hover"])
         self.clear_btn.configure(bg=self.theme["clear_btn"], activebackground=self.theme["button_hover"])
-        self.refresh_btn.configure(bg=self.theme["refresh_btn"], activebackground=self.theme["button_hover"])
         self.theme_btn.configure(bg=self.theme["theme_btn"], activebackground=self.theme["button_hover"])
 
         self.render_table()
@@ -174,28 +172,33 @@ class MacroToolApp:
             return
 
         self.directory = directory
-        macro_files = [f for f in os.listdir(directory) if f.lower().endswith((".xlsm", ".pdf", ".docx"))]
+        supported_extensions = (".xlsm", ".pdf", ".docx", ".txt")
+        macro_files = [f for f in os.listdir(directory) if f.lower().endswith(supported_extensions)]
         if not macro_files:
-            messagebox.showinfo("Info", "No .xlsm files found in the selected directory.")
+            messagebox.showinfo("Info", "No supported files found in the selected directory.")
             return
 
-        display_names = [os.path.splitext(f)[0] for f in macro_files]
+        # Use full filenames to avoid duplicates
+        display_names = macro_files
         self.status_dict = {name: "Pending" for name in display_names}
         self.status_lines = [[name, "Pending"] for name in display_names]
         self.render_table()
         self.clear_logs()
         self.start_btn.config(state=tk.DISABLED)
 
-        for original_file, display_name in zip(macro_files, display_names):
-            full_path = os.path.join(directory, original_file)
-            threading.Thread(target=self.run_macro_thread, args=(display_name, full_path), daemon=True).start()
+        threading.Thread(target=self.run_macro_thread, args=(directory,), daemon=True).start()
 
-    def run_macro_thread(self, macro_name, file_path):
-        self.update_status(macro_name, "Running...")
-        perform_operation(file_path, lambda msg: self.add_log(macro_name, msg))
-        self.update_status(macro_name, "Completed")
-        if all(status == "Completed" for status in self.status_dict.values()):
-            self.finish()
+    def run_macro_thread(self, directory):
+        def status_update(macro_name, status):
+            self.update_status(macro_name, status)
+
+        def log_update(msg):
+            self.add_log("System", msg)
+
+        perform_operation(directory, log_update, status_update)
+
+        self.start_btn.config(state=tk.NORMAL)
+        self.finish()
 
     def update_status(self, macro_name, status):
         with self.lock:
@@ -209,7 +212,9 @@ class MacroToolApp:
         for i, (macro, status) in enumerate(self.status_lines):
             tk.Label(self.table_frame, text=macro, width=30, anchor="w", font=self.font,
                      bg=self.theme["entry_bg"], fg=self.theme["fg"]).grid(row=i, column=0, padx=2, pady=2)
-            color = self.theme["success"] if "Completed" in status else self.theme["running"] if "Running" in status else self.theme["fg"]
+            color = (self.theme["success"] if "Completed" in status
+                     else self.theme["running"] if "Running" in status
+                     else self.theme["fg"])
             tk.Label(self.table_frame, text=status, width=15, anchor="w", font=self.font,
                      bg=self.theme["entry_bg"], fg=color).grid(row=i, column=1, padx=2, pady=2)
 
@@ -230,13 +235,6 @@ class MacroToolApp:
         self.log_view.delete("1.0", tk.END)
         self.log_view.config(state=tk.DISABLED)
         self.status_label.config(text="")
-
-    def refresh_status(self):
-        for key in self.status_dict:
-            self.status_dict[key] = "Pending"
-        self.status_lines = [[k, "Pending"] for k in self.status_dict]
-        self.render_table()
-        self.status_label.config(text="Table refreshed.")
 
     def finish(self):
         self.start_btn.config(state=tk.NORMAL)
