@@ -1,183 +1,196 @@
 import os
-import time
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.edge.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException,
-    ElementClickInterceptedException,
-    WebDriverException,
-)
+import pandas as pd
+import logging
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
 
+class ExcelBackendProcessor:
+    def __init__(self, report_file, cdr_file, output_file):
+        self.report_file = report_file
+        self.cdr_file = cdr_file
+        self.output_file = output_file
+        self.wb = None
+        self.section_dfs = []
+        self.investor_entry_df = None
+        self.conn_df = None
+        self.investor_allocation_df = None
 
-class CdrAutomation:
-    def __init__(self, browser_name: str, headless=False):
-        self.user_id = "your_user_id"
-        self.passcode = "your_password"
-        self.search_value = "Mountain Private Equity Partners"
-        self.driver_location = f"C:\\Drivers\\{browser_name}"
-        self.map_url = "https://example.com/login"  # <-- replace with real URL
-        self.headless = headless
-        self.browser_name = browser_name
-        self.retry_attempts = 3
-        self.retry_delay = 2
+        logging.basicConfig(
+            filename='excel_processor_debug.log',
+            level=logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.log_debug("Processor initialized.")
 
-    # -------------------------------------------------------------------------
-    # Driver setup
-    # -------------------------------------------------------------------------
-    def get_driver_path(self):
-        for root, dirs, files in os.walk(self.driver_location):
-            for file in files:
-                if file.startswith("msedgedriver") and file.endswith(".exe"):
-                    return os.path.join(root, file)
-        raise FileNotFoundError("EdgeDriver not found in specified location.")
+    def log_debug(self, message):
+        logging.debug(message)
+        print(f"[DEBUG] {message}")
 
-    def create_driver(self):
-        options = webdriver.EdgeOptions()
-        options.add_argument("--window-size=1200,900")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        if self.headless:
-            options.add_argument("--headless=new")
+    def normalize_keys(self, series):
+        return series.astype(str).str.upper().str.replace(r'\s+', '', regex=True).fillna("")
 
-        service = Service(self.get_driver_path())
-        driver = webdriver.Edge(service=service, options=options)
-        driver.set_page_load_timeout(60)
-        return driver
+    def normalize(self, name):
+        return str(name).strip().upper().replace(" ", "").replace("_", "").replace("/", "").replace(".", "")
 
-    # -------------------------------------------------------------------------
-    # Utilities
-    # -------------------------------------------------------------------------
-    def safe_click(self, browser, locator_type, locator, description=""):
-        """Click an element safely. If it fails, return False so automation can stop."""
-        for attempt in range(self.retry_attempts):
-            try:
-                element = WebDriverWait(browser, 15).until(
-                    EC.element_to_be_clickable((locator_type, locator))
-                )
-                browser.execute_script("arguments[0].scrollIntoView(true);", element)
-                try:
-                    element.click()
-                except ElementClickInterceptedException:
-                    browser.execute_script("arguments[0].click();", element)
-                print(f"✅ Clicked: {description or locator}")
-                return True
-            except TimeoutException:
-                print(f"⚠️ Attempt {attempt+1}: {description or locator} not clickable. Retrying...")
-                time.sleep(self.retry_delay)
-        print(f"❌ Failed to click: {description or locator}")
-        return False
+    def apply_theme(self, sheet):
+        """Apply consistent styling to Excel sheet."""
+        for r_idx, row in enumerate(sheet.iter_rows(), start=1):
+            for cell in row:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                if r_idx == 1:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill(start_color="003366", end_color="003366", fill_type="solid")
+                elif r_idx == sheet.max_row:
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+                elif r_idx % 2 == 0:
+                    cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
-    def wait_for_element(self, browser, locator_type, locator, timeout=30):
-        try:
-            return WebDriverWait(browser, timeout).until(
-                EC.presence_of_element_located((locator_type, locator))
-            )
-        except TimeoutException:
-            return None
-
-    def wait_for_page_ready(self, browser, timeout=30):
-        WebDriverWait(browser, timeout).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
+    def load_data(self):
+        """Load report and CDR files, split into multiple section DataFrames."""
+        self.log_debug("Loading data...")
+        self.cdr_summary_df = pd.read_excel(
+            self.report_file,
+            sheet_name="CDR Summary By Investor",
+            skiprows=2,
+            engine="openpyxl",
+            dtype=object
         )
 
-    def wait_for_loading_to_disappear(self, browser, timeout=30):
-        """Wait for loading spinner (if any) to disappear."""
-        try:
-            WebDriverWait(browser, timeout).until_not(
-                EC.presence_of_element_located((By.CLASS_NAME, "dwf-loading-icon"))
-            )
-        except TimeoutException:
-            print("⚠️ Loading spinner did not disappear (may not exist).")
+        # Split by Subtotal rows
+        subtotal_rows = self.cdr_summary_df[
+            self.cdr_summary_df.iloc[:, 0].astype(str).str.startswith("Subtotal:", na=False)
+        ].index.tolist()
+        split_points = [0] + subtotal_rows + [len(self.cdr_summary_df)]
 
-    def switch_to_new_tab(self, browser):
-        """Switch to the newest tab."""
-        WebDriverWait(browser, 20).until(lambda d: len(d.window_handles) > 1)
-        browser.switch_to.window(browser.window_handles[-1])
-        self.wait_for_page_ready(browser)
-        self.wait_for_loading_to_disappear(browser)
-        print("🧭 Switched to new tab and waited for load.")
+        for i in range(len(split_points) - 1):
+            start, end = split_points[i], split_points[i + 1]
+            part = self.cdr_summary_df.iloc[start:end].dropna(how='all')
+            part = part[~part.iloc[:, 0].astype(str).str.startswith("Subtotal:", na=False)]
+            if not part.empty:
+                self.section_dfs.append(part)
 
-    # -------------------------------------------------------------------------
-    # Main workflow
-    # -------------------------------------------------------------------------
-    def run(self):
-        browser = None
-        try:
-            browser = self.create_driver()
-            browser.get(self.map_url)
-            print("🌐 Opened login page.")
+        if not self.section_dfs:
+            self.section_dfs = [self.cdr_summary_df]
 
-            # Accept cookies if popup exists
-            self.safe_click(browser, By.XPATH, "//button[contains(text(), 'Accept') or contains(text(), 'OK')]", "Accept Cookies")
+        # Load other sheets
+        self.investor_entry_df = pd.read_excel(
+            self.cdr_file, sheet_name="investor_format", engine="openpyxl", dtype=object
+        )
+        self.conn_df = pd.read_excel(
+            self.cdr_file, sheet_name=0, engine="openpyxl", dtype=object
+        )
+        self.investor_allocation_df = pd.read_excel(
+            self.cdr_file, sheet_name="allocation_data", engine="openpyxl", dtype=object
+        )
 
-            # Try to find username/password fields
-            username_field = self.wait_for_element(browser, By.NAME, "username", 5)
-            password_field = self.wait_for_element(browser, By.NAME, "password", 5)
+        self.log_debug("Data loaded successfully.")
 
-            # Logic: if login fields available → enter creds, else just click Login
-            if username_field and password_field:
-                username_field.send_keys(self.user_id)
-                password_field.send_keys(self.passcode)
-                print("👤 Credentials entered.")
-                clicked = self.safe_click(browser, By.XPATH, "//input[@value='Log in']", "Login Button")
-                if not clicked:
-                    print("❌ Login button could not be clicked. Stopping automation.")
-                    return
-            else:
-                print("⚠️ Username/password fields not found — trying direct login.")
-                clicked = self.safe_click(browser, By.XPATH, "//input[@value='Log in']", "Login Button (Direct)")
-                if not clicked:
-                    print("❌ Direct login button not clickable. Stopping automation.")
-                    return
+    # -------------------- SHEET CREATION FUNCTIONS --------------------
 
-            # Wait for main page to load
-            self.wait_for_page_ready(browser)
-            self.wait_for_loading_to_disappear(browser)
+    def create_commitment_sheet(self, conn_df, section_df, start_row=1):
+        ws_name = "Commitment"
+        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        row_offset = start_row
 
-            # Go to Accounting
-            if not self.safe_click(browser, By.CLASS_NAME, "fis-home", "Home Button"):
-                print("❌ Home button click failed. Stopping automation.")
-                return
+        # Write section
+        for r_idx, row in enumerate(dataframe_to_rows(conn_df, index=False, header=True), start=0):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=row_offset + r_idx, column=c_idx, value=value)
+        row_offset += len(conn_df)
 
-            if not self.safe_click(browser, By.XPATH, "//div[text()='Accounting' and contains(@class, 'ng-binding')]", "Accounting (Menu)"):
-                print("❌ Accounting menu click failed. Stopping automation.")
-                return
+        # Subtotal row
+        subtotal_row = ['Subtotal'] + [""] * (conn_df.shape[1] - 1)
+        for col in ['Commitment Amount', 'Investor Commitment']:
+            if col in conn_df.columns:
+                subtotal_row[conn_df.columns.get_loc(col)] = pd.to_numeric(conn_df[col], errors='coerce').sum()
+        for c_idx, value in enumerate(subtotal_row, start=1):
+            ws.cell(row=row_offset + 1, column=c_idx, value=value)
 
-            if not self.safe_click(browser, By.XPATH, "//a[text()='Accounting' and contains(@class, 'ng-binding')]", "Accounting (Link)"):
-                print("❌ Accounting link click failed. Stopping automation.")
-                return
+        # Style subtotal
+        total_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        for col_idx in range(1, ws.max_column + 1):
+            ws.cell(row=row_offset + 1, column=col_idx).fill = total_fill
 
-            # Switch tab and wait for full load
-            self.switch_to_new_tab(browser)
-            print("📄 Accounting page opened successfully.")
+        self.apply_theme(ws)
+        return row_offset + 3
 
-            # Once loaded, wait for input and enter data
-            input_box = self.wait_for_element(browser, By.XPATH, "//input[@placeholder='Search...']", 20)
-            if input_box:
-                input_box.send_keys(self.search_value)
-                print("✅ Search value entered successfully.")
-            else:
-                print("❌ Input box not found after Accounting page loaded.")
+    def create_entry_sheet(self, entry_df, section_df, start_row=1):
+        ws_name = "Entry"
+        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        row_offset = start_row
 
-        except WebDriverException as e:
-            print("⚠️ WebDriver error:", e)
-        except Exception as e:
-            print("⚠️ Unexpected error:", e)
-        finally:
-            if browser:
-                try:
-                    browser.quit()
-                    print("🧹 Browser closed.")
-                except Exception:
-                    pass
+        for r_idx, row in enumerate(dataframe_to_rows(entry_df, index=False, header=True), start=0):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=row_offset + r_idx, column=c_idx, value=value)
+        row_offset += len(entry_df)
+
+        subtotal_row = ['Subtotal'] + [""] * (entry_df.shape[1] - 1)
+        for col in entry_df.columns:
+            if any(x in col for x in ["Contributions", "Distributions", "Expenses"]):
+                subtotal_row[entry_df.columns.get_loc(col)] = pd.to_numeric(entry_df[col], errors='coerce').sum()
+        for c_idx, value in enumerate(subtotal_row, start=1):
+            ws.cell(row=row_offset + 1, column=c_idx, value=value)
+
+        total_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        for col_idx in range(1, ws.max_column + 1):
+            ws.cell(row=row_offset + 1, column=col_idx).fill = total_fill
+
+        self.apply_theme(ws)
+        return row_offset + 3
+
+    def create_approx_matches_sheet(self, conn_df, section_df, start_row=1):
+        ws_name = "ApproxMatches"
+        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        row_offset = start_row
+
+        approx_df = pd.DataFrame({
+            "Conn Key": conn_df.get("Bin ID", []),
+            "Investor ID": conn_df.get("Investor Acct ID", [])
+        })
+
+        for r_idx, row in enumerate(dataframe_to_rows(approx_df, index=False, header=True), start=0):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=row_offset + r_idx, column=c_idx, value=value)
+        row_offset += len(approx_df)
+
+        subtotal_row = ["Subtotal"] + [""] * (approx_df.shape[1] - 1)
+        for c_idx, value in enumerate(subtotal_row, start=1):
+            ws.cell(row=row_offset + 1, column=c_idx, value=value)
+
+        total_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        for col_idx in range(1, ws.max_column + 1):
+            ws.cell(row=row_offset + 1, column=col_idx).fill = total_fill
+
+        self.apply_theme(ws)
+        return row_offset + 3
+
+    # -------------------- MAIN PROCESS FUNCTION --------------------
+
+    def process_sections(self):
+        self.load_data()
+        self.wb = load_workbook(filename=self.report_file)
+
+        # Remove old sheets
+        for sheet_name in ["Commitment", "Entry", "ApproxMatches"]:
+            if sheet_name in self.wb.sheetnames:
+                del self.wb[sheet_name]
+
+        self.log_debug("Processing sections...")
+        row_offsets = {"Commitment": 1, "Entry": 1, "ApproxMatches": 1}
+
+        for idx, section_df in enumerate(self.section_dfs, start=1):
+            self.log_debug(f"Processing section {idx}")
+            row_offsets["Commitment"] = self.create_commitment_sheet(self.conn_df, section_df, start_row=row_offsets["Commitment"])
+            row_offsets["Entry"] = self.create_entry_sheet(self.investor_entry_df, section_df, start_row=row_offsets["Entry"])
+            row_offsets["ApproxMatches"] = self.create_approx_matches_sheet(self.conn_df, section_df, start_row=row_offsets["ApproxMatches"])
+
+        self.wb.save(self.output_file)
+        self.log_debug(f"Workbook saved to {self.output_file}")
 
 
-# -------------------------------------------------------------------------
-# Entry point
-# -------------------------------------------------------------------------
-if __name__ == "__main__":
-    automation = CdrAutomation(browser_name="Edge", headless=False)
-    automation.run()
+# Example usage:
+# processor = ExcelBackendProcessor("report.xlsx", "cdr.xlsx", "output.xlsx")
+# processor.process_sections()
