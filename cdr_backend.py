@@ -11,6 +11,7 @@ class ExcelBackendProcessor:
         self.report_file = report_file
         self.cdr_file = cdr_file
         self.output_file = output_file
+
         self.wb = None
         self.section_dfs = []
         self.investor_entry_df = None
@@ -35,7 +36,6 @@ class ExcelBackendProcessor:
         return str(name).strip().upper().replace(" ", "").replace("_", "").replace("/", "").replace(".", "")
 
     def apply_theme(self, sheet):
-        """Apply consistent styling to Excel sheet."""
         for r_idx, row in enumerate(sheet.iter_rows(), start=1):
             for cell in row:
                 cell.alignment = Alignment(horizontal='center', vertical='center')
@@ -49,9 +49,8 @@ class ExcelBackendProcessor:
                     cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 
     def load_data(self):
-        """Load report and CDR files, split into multiple section DataFrames."""
         self.log_debug("Loading data...")
-        # Load CDR summary (update name if it differs)
+
         self.cdr_summary_df = pd.read_excel(
             self.report_file,
             sheet_name="CDR Summary By Investor",
@@ -60,7 +59,6 @@ class ExcelBackendProcessor:
             dtype=object
         )
 
-        # Split by subtotal markers
         subtotal_rows = self.cdr_summary_df[
             self.cdr_summary_df.iloc[:, 0].astype(str).str.startswith("Subtotal:", na=False)
         ].index.tolist()
@@ -76,7 +74,6 @@ class ExcelBackendProcessor:
         if not self.section_dfs:
             self.section_dfs = [self.cdr_summary_df]
 
-        # Load other sheets
         self.investor_entry_df = pd.read_excel(
             self.cdr_file, sheet_name="investor_format", engine="openpyxl", dtype=object
         )
@@ -86,14 +83,13 @@ class ExcelBackendProcessor:
         self.investor_allocation_df = pd.read_excel(
             self.cdr_file, sheet_name="allocation_data", engine="openpyxl", dtype=object
         )
+
         self.log_debug("Data loaded successfully.")
 
-    # -------------------- COMMITMENT SHEET FIX --------------------
-
+    # ---- Commitment Sheet (with subtotal fix) ----
     def create_commitment_sheet(self, conn_df, start_row=1):
-        """Write conn_df to Commitment sheet with subtotals per investor."""
         ws_name = "Commitment"
-        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        ws = self.wb.create_sheet(title=ws_name)
         row_offset = start_row
 
         if conn_df is None or conn_df.shape[0] == 0:
@@ -109,13 +105,14 @@ class ExcelBackendProcessor:
 
         prev_investor = None
         running_sum = 0.0
+        rows_written_for_group = 0
 
         for _, row in conn_df.iterrows():
             investor = row.get(group_col, "")
+
             if prev_investor is None:
                 prev_investor = investor
 
-            # subtotal when investor changes
             if investor != prev_investor:
                 subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
                 if value_col in header:
@@ -123,35 +120,41 @@ class ExcelBackendProcessor:
                 for c_idx, val in enumerate(subtotal_row, start=1):
                     ws.cell(row=row_offset, column=c_idx, value=val)
                 for c_idx in range(1, len(header) + 1):
-                    ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+                    ws.cell(row=row_offset, column=c_idx).fill = PatternFill(
+                        start_color="FFFF99", end_color="FFFF99", fill_type="solid")
                 row_offset += 1
                 running_sum = 0.0
+                rows_written_for_group = 0
                 prev_investor = investor
 
             for c_idx, col in enumerate(header, start=1):
                 ws.cell(row=row_offset, column=c_idx, value=row.get(col))
-            try:
-                running_sum += float(row.get(value_col, 0) or 0)
-            except Exception:
-                pass
+            if value_col in header:
+                try:
+                    running_sum += float(row.get(value_col) or 0)
+                except Exception:
+                    pass
+            row_offset += 1
+            rows_written_for_group += 1
+
+        if rows_written_for_group > 0:
+            subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
+            if value_col in header:
+                subtotal_row[header.index(value_col)] = running_sum
+            for c_idx, val in enumerate(subtotal_row, start=1):
+                ws.cell(row=row_offset, column=c_idx, value=val)
+            for c_idx in range(1, len(header) + 1):
+                ws.cell(row=row_offset, column=c_idx).fill = PatternFill(
+                    start_color="FFFF99", end_color="FFFF99", fill_type="solid")
             row_offset += 1
 
-        # subtotal for last investor
-        subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
-        if value_col in header:
-            subtotal_row[header.index(value_col)] = running_sum
-        for c_idx, val in enumerate(subtotal_row, start=1):
-            ws.cell(row=row_offset, column=c_idx, value=val)
-        for c_idx in range(1, len(header) + 1):
-            ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
         self.apply_theme(ws)
-        return row_offset + 1
+        return row_offset
 
-    # -------------------- ENTRY SHEET --------------------
-
+    # ---- Entry Sheet (unchanged) ----
     def create_entry_sheet(self, entry_df, start_row=1):
         ws_name = "Entry"
-        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        ws = self.wb.create_sheet(title=ws_name)
         row_offset = start_row
 
         if entry_df is None or entry_df.shape[0] == 0:
@@ -169,23 +172,23 @@ class ExcelBackendProcessor:
 
         subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
         for i, col in enumerate(header):
-            if any(k in col for k in ["Contributions", "Distributions", "Expenses"]):
+            if any(k in col for k in ["Contributions", "Distributions", "Expenses", "ExternalExpenses"]):
                 subtotal_row[i] = pd.to_numeric(entry_df[col], errors='coerce').sum()
         for c_idx, val in enumerate(subtotal_row, start=1):
             ws.cell(row=row_offset, column=c_idx, value=val)
         for c_idx in range(1, len(header) + 1):
-            ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+            ws.cell(row=row_offset, column=c_idx).fill = PatternFill(
+                start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+
         self.apply_theme(ws)
         return row_offset + 1
 
-    # -------------------- FIXED APPROX MATCHES SHEET --------------------
-
+    # ---- ApproxMatches (safe fix only) ----
     def create_approx_matches_sheet(self, conn_df, start_row=1):
         ws_name = "ApproxMatches"
-        ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
+        ws = self.wb.create_sheet(title=ws_name)
         row_offset = start_row
 
-        # Handle safe column extraction
         cols = []
         if "Bin ID" in conn_df.columns:
             cols.append("Bin ID")
@@ -206,31 +209,32 @@ class ExcelBackendProcessor:
                 ws.cell(row=r_idx, column=c_idx, value=value)
 
         self.apply_theme(ws)
-        return row_offset + len(approx_df) + 2
+        return row_offset + len(approx_df) + 1
 
-    # -------------------- MAIN WORKFLOW --------------------
-
+    # ---- Main workflow (corrected: use report_file, not output_file) ----
     def process_sections(self):
         self.load_data()
-        try:
-            self.wb = load_workbook(filename=self.report_file)
-        except Exception:
-            self.wb = Workbook()
 
+        # ✅ Load report_file as base workbook (your original logic)
+        self.wb = load_workbook(filename=self.report_file)
+        self.log_debug(f"Loaded workbook from {self.report_file}")
+
+        # Remove only relevant sheets to keep others intact
         for sheet_name in ["Commitment", "Entry", "ApproxMatches"]:
             if sheet_name in self.wb.sheetnames:
                 del self.wb[sheet_name]
 
-        self.log_debug("Processing sections...")
+        self.log_debug("Creating updated sheets...")
 
         self.create_commitment_sheet(self.conn_df, start_row=1)
         self.create_entry_sheet(self.investor_entry_df, start_row=1)
         self.create_approx_matches_sheet(self.conn_df, start_row=1)
 
+        # ✅ Save to output file (new file)
         self.wb.save(self.output_file)
         self.log_debug(f"Workbook saved to {self.output_file}")
 
 
-# Example usage:
+# Example:
 # processor = ExcelBackendProcessor("report.xlsx", "cdr.xlsx", "output.xlsx")
 # processor.process_sections()
