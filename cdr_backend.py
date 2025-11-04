@@ -51,7 +51,7 @@ class ExcelBackendProcessor:
     def load_data(self):
         """Load report and CDR files, split into multiple section DataFrames."""
         self.log_debug("Loading data...")
-        # load CDR summary (adjust sheet_name if your file differs in exact naming)
+        # Load CDR summary (update name if it differs)
         self.cdr_summary_df = pd.read_excel(
             self.report_file,
             sheet_name="CDR Summary By Investor",
@@ -60,7 +60,7 @@ class ExcelBackendProcessor:
             dtype=object
         )
 
-        # Split by Subtotal marker rows (keeps original splitting behaviour)
+        # Split by subtotal markers
         subtotal_rows = self.cdr_summary_df[
             self.cdr_summary_df.iloc[:, 0].astype(str).str.startswith("Subtotal:", na=False)
         ].index.tolist()
@@ -76,7 +76,7 @@ class ExcelBackendProcessor:
         if not self.section_dfs:
             self.section_dfs = [self.cdr_summary_df]
 
-        # Load other sheets from CDR file
+        # Load other sheets
         self.investor_entry_df = pd.read_excel(
             self.cdr_file, sheet_name="investor_format", engine="openpyxl", dtype=object
         )
@@ -86,100 +86,68 @@ class ExcelBackendProcessor:
         self.investor_allocation_df = pd.read_excel(
             self.cdr_file, sheet_name="allocation_data", engine="openpyxl", dtype=object
         )
-
         self.log_debug("Data loaded successfully.")
 
-    # -------------------- COMMITMENT SHEET (minimal-change, investor-subtotals) --------------------
+    # -------------------- COMMITMENT SHEET FIX --------------------
 
     def create_commitment_sheet(self, conn_df, start_row=1):
-        """
-        Writes conn_df into a single Commitment sheet in the workbook.
-        Inserts a subtotal row immediately after each Investor Name group,
-        summing the 'Commitment Amount' (or other specified numeric columns if needed).
-        This preserves row order from conn_df.
-        """
+        """Write conn_df to Commitment sheet with subtotals per investor."""
         ws_name = "Commitment"
         ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
         row_offset = start_row
 
-        # If conn_df is empty, just return
         if conn_df is None or conn_df.shape[0] == 0:
             return row_offset
 
-        # Ensure relevant columns exist
-        # Primary grouping key: 'Investor Name' (use exact column name from your source)
-        group_col = "Investor Name"
-        value_col = "Commitment Amount"  # column to sum for subtotal; adjust if needed
-
-        # Write header once
         header = list(conn_df.columns)
         for c_idx, h in enumerate(header, start=1):
             ws.cell(row=row_offset, column=c_idx, value=h)
-        header_row_idx = row_offset
         row_offset += 1
 
-        # Iterate rows in order, write row-by-row, and detect group changes by Investor Name
+        group_col = "Investor Name"
+        value_col = "Commitment Amount"
+
         prev_investor = None
         running_sum = 0.0
-        rows_written_for_group = 0
 
         for _, row in conn_df.iterrows():
             investor = row.get(group_col, "")
-            # if first row or same investor:
             if prev_investor is None:
                 prev_investor = investor
 
-            # If investor changed, write subtotal for previous investor first
+            # subtotal when investor changes
             if investor != prev_investor:
-                # write subtotal row for prev_investor
                 subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
-                # place sum in the column corresponding to value_col if present
-                if value_col in conn_df.columns:
-                    idx = header.index(value_col)  # zero-based
-                    subtotal_row[idx] = running_sum
+                if value_col in header:
+                    subtotal_row[header.index(value_col)] = running_sum
                 for c_idx, val in enumerate(subtotal_row, start=1):
                     ws.cell(row=row_offset, column=c_idx, value=val)
-                # style subtotal fill immediately (optional)
                 for c_idx in range(1, len(header) + 1):
                     ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
                 row_offset += 1
-
-                # reset running sum for new investor
                 running_sum = 0.0
-                rows_written_for_group = 0
                 prev_investor = investor
 
-            # Write the current row data
             for c_idx, col in enumerate(header, start=1):
                 ws.cell(row=row_offset, column=c_idx, value=row.get(col))
-            # Add to running sum if numeric
-            if value_col in conn_df.columns:
-                try:
-                    val = float(row.get(value_col)) if row.get(value_col) not in (None, "") else 0.0
-                except Exception:
-                    val = 0.0
-                running_sum += val
-
-            row_offset += 1
-            rows_written_for_group += 1
-
-        # After loop, write subtotal for the last investor group
-        if rows_written_for_group > 0:
-            subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
-            if value_col in conn_df.columns:
-                idx = header.index(value_col)
-                subtotal_row[idx] = running_sum
-            for c_idx, val in enumerate(subtotal_row, start=1):
-                ws.cell(row=row_offset, column=c_idx, value=val)
-            for c_idx in range(1, len(header) + 1):
-                ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+            try:
+                running_sum += float(row.get(value_col, 0) or 0)
+            except Exception:
+                pass
             row_offset += 1
 
-        # Apply theme (header / alternate rows / last-row style)
+        # subtotal for last investor
+        subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
+        if value_col in header:
+            subtotal_row[header.index(value_col)] = running_sum
+        for c_idx, val in enumerate(subtotal_row, start=1):
+            ws.cell(row=row_offset, column=c_idx, value=val)
+        for c_idx in range(1, len(header) + 1):
+            ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
         self.apply_theme(ws)
-        return row_offset + 1  # small spacing after sheet content
+        return row_offset + 1
 
-    # -------------------- ENTRY & APPROX MATCHES (unchanged behavior) --------------------
+    # -------------------- ENTRY SHEET --------------------
 
     def create_entry_sheet(self, entry_df, start_row=1):
         ws_name = "Entry"
@@ -189,88 +157,73 @@ class ExcelBackendProcessor:
         if entry_df is None or entry_df.shape[0] == 0:
             return row_offset
 
-        # Header
         header = list(entry_df.columns)
         for c_idx, h in enumerate(header, start=1):
             ws.cell(row=row_offset, column=c_idx, value=h)
         row_offset += 1
 
-        # Write rows
         for _, row in entry_df.iterrows():
             for c_idx, col in enumerate(header, start=1):
                 ws.cell(row=row_offset, column=c_idx, value=row.get(col))
             row_offset += 1
 
-        # Add a subtotal row similar to earlier logic (if you used it before)
         subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
-        # sum contributions/distributions/expenses if those columns exist
         for i, col in enumerate(header):
-            if any(k in col for k in ["Contributions", "Distributions", "ExternalExpenses", "Expenses"]):
+            if any(k in col for k in ["Contributions", "Distributions", "Expenses"]):
                 subtotal_row[i] = pd.to_numeric(entry_df[col], errors='coerce').sum()
         for c_idx, val in enumerate(subtotal_row, start=1):
             ws.cell(row=row_offset, column=c_idx, value=val)
         for c_idx in range(1, len(header) + 1):
             ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-        row_offset += 1
-
         self.apply_theme(ws)
         return row_offset + 1
+
+    # -------------------- FIXED APPROX MATCHES SHEET --------------------
 
     def create_approx_matches_sheet(self, conn_df, start_row=1):
         ws_name = "ApproxMatches"
         ws = self.wb[ws_name] if ws_name in self.wb.sheetnames else self.wb.create_sheet(title=ws_name)
         row_offset = start_row
 
-        approx_df = pd.DataFrame({
-            "Conn Key": conn_df.get("Bin ID", []),
-            "Investor ID": conn_df.get("Investor Acct ID", [])
-        })
+        # Handle safe column extraction
+        cols = []
+        if "Bin ID" in conn_df.columns:
+            cols.append("Bin ID")
+        if "Investor Acct ID" in conn_df.columns:
+            cols.append("Investor Acct ID")
+        elif "Investor ID" in conn_df.columns:
+            cols.append("Investor ID")
 
-        if approx_df.shape[0] == 0:
+        if not cols:
+            self.log_debug("No matching columns found for ApproxMatches — skipping.")
             return row_offset
 
-        header = list(approx_df.columns)
-        for c_idx, h in enumerate(header, start=1):
-            ws.cell(row=row_offset, column=c_idx, value=h)
-        row_offset += 1
+        approx_df = conn_df[cols].copy()
+        approx_df.columns = ["Conn Key", "Investor ID"][:len(approx_df.columns)]
 
-        for _, row in approx_df.iterrows():
-            for c_idx, col in enumerate(header, start=1):
-                ws.cell(row=row_offset, column=c_idx, value=row.get(col))
-            row_offset += 1
-
-        subtotal_row = ["Subtotal"] + [""] * (len(header) - 1)
-        for c_idx, val in enumerate(subtotal_row, start=1):
-            ws.cell(row=row_offset, column=c_idx, value=val)
-        for c_idx in range(1, len(header) + 1):
-            ws.cell(row=row_offset, column=c_idx).fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        for r_idx, row in enumerate(dataframe_to_rows(approx_df, index=False, header=True), start=row_offset):
+            for c_idx, value in enumerate(row, start=1):
+                ws.cell(row=r_idx, column=c_idx, value=value)
 
         self.apply_theme(ws)
-        return row_offset + 2
+        return row_offset + len(approx_df) + 2
 
-    # -------------------- MAIN PROCESS FUNCTION --------------------
+    # -------------------- MAIN WORKFLOW --------------------
 
     def process_sections(self):
         self.load_data()
-        # Load workbook (use report file as base) — create a new Workbook if you prefer
         try:
             self.wb = load_workbook(filename=self.report_file)
         except Exception:
             self.wb = Workbook()
 
-        # Remove old sheets we will recreate
         for sheet_name in ["Commitment", "Entry", "ApproxMatches"]:
             if sheet_name in self.wb.sheetnames:
                 del self.wb[sheet_name]
 
         self.log_debug("Processing sections...")
 
-        # For Commitment sheet: we want to preserve conn_df ordering and insert subtotals per investor.
-        # Use the raw connection dataframe exactly as source script did.
-        # IMPORTANT: do not modify conn_df ordering here unless your source expects sorting.
         self.create_commitment_sheet(self.conn_df, start_row=1)
-
-        # For Entry and ApproxMatches: write once using the loaded investor_entry_df and conn_df
         self.create_entry_sheet(self.investor_entry_df, start_row=1)
         self.create_approx_matches_sheet(self.conn_df, start_row=1)
 
