@@ -1,29 +1,32 @@
-# excel_processor.py
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
-from openpyxl import load_workbook, Workbook
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import PatternFill, Font, Alignment
-
-logging.basicConfig(
-    filename="excel_processor_debug.log",
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 
 
 class ExcelBackendProcessor:
+    """
+    Excel Backend Processor
+    -----------------------
+    Loads and merges Excel data from report and CDR files,
+    normalizes investor and BIN IDs, and generates:
+      • Commitment Sheet
+      • Entry Sheet
+      • Approx Matches Sheet
+    """
+
     def __init__(
         self,
         report_file: str,
         cdr_file: str,
         output_file: str,
         headless: bool = False,
-        log_callback: Optional[Any] = None,
+        log_callback=None,
     ):
         self.report_file = report_file
         self.cdr_file = cdr_file
@@ -31,45 +34,44 @@ class ExcelBackendProcessor:
         self.headless = headless
         self.log_callback = log_callback
 
-        # Data containers
-        self.wb: Optional[Workbook] = None
-        self.conn_df: Optional[pd.DataFrame] = None
-        self.investor_entry_df: Optional[pd.DataFrame] = None
-        self.cdr_summary_df: Optional[pd.DataFrame] = None
-        self.lookup_df: Optional[pd.DataFrame] = None
-        self.investor_allocation_df: Optional[pd.DataFrame] = None
-        self.mapping: Dict[str, Any] = {}
+        self.wb = None
+        self.conn_df = None
+        self.investor_entry_df = None
+        self.cdr_summary_df = None
+        self.investor_allocation_df = None
+        self.lookup_df = None
+        self.mapping = {}
 
         if self.headless:
+            logging.basicConfig(
+                filename="excel_processor_debug.log",
+                level=logging.DEBUG,
+                format="%(asctime)s - %(levelname)s - %(message)s",
+            )
             self.log_debug("Headless mode is enabled. Debug logging started.")
 
+    # -----------------------------
+    # Logging & normalization utils
+    # -----------------------------
     def log_debug(self, message: str):
-        logging.debug(message)
         if self.log_callback:
             try:
-                self.log_callback("debug", message)
+                self.log_callback("DEBUG", message)
             except Exception:
                 pass
+        logging.debug(message)
 
-    # ---- Normalizers ----
-    @staticmethod
-    def normalize_keys(series: pd.Series) -> pd.Series:
+    def normalize_keys(self, series: pd.Series) -> pd.Series:
         return (
             series.astype(str)
             .str.upper()
             .str.replace(r"\s+", "", regex=True)
-            .str.replace(r"[^0-9A-Z]", "", regex=True)
             .fillna("")
         )
 
-    @staticmethod
-    def normalize(name: str) -> str:
-        try:
-            nm = name.split("_")[-1]
-        except Exception:
-            nm = name
+    def normalize(self, name: str) -> str:
         return (
-            str(nm)
+            str(name)
             .strip()
             .upper()
             .replace(" ", "")
@@ -78,231 +80,242 @@ class ExcelBackendProcessor:
             .replace(".", "")
         )
 
-    # ---- Formatting helpers ----
     def apply_theme(self, sheet):
-        """Apply basic alignment, header/footer styling and zebra fill."""
-        header_fill = PatternFill(start_color="093366", end_color="093366", fill_type="solid")
-        footer_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-        alt_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-
-        for r_idx, row in enumerate(sheet.iter_rows(values_only=False), start=1):
+        for r_idx, row in enumerate(sheet.iter_rows(), start=1):
             for cell in row:
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 if cell.value in ("Blank1", "Blank2", None):
                     continue
                 if r_idx == 1:
                     cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = header_fill
+                    cell.fill = PatternFill(
+                        start_color="003366", end_color="003366", fill_type="solid"
+                    )
                 elif r_idx == sheet.max_row:
                     cell.font = Font(bold=True)
-                    cell.fill = footer_fill
+                    cell.fill = PatternFill(
+                        start_color="FFFF99", end_color="FFFF99", fill_type="solid"
+                    )
                 elif r_idx % 2 == 0:
-                    cell.fill = alt_fill
+                    cell.fill = PatternFill(
+                        start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"
+                    )
 
-    # ---- Load & Preprocess ----
+    # ------------------
+    # Step 1: Load data
+    # ------------------
     def load_data(self):
         self.log_debug("Loading data from Excel files.")
-        # Adjust sheet names exactly as in your files
+
         self.cdr_summary_df = pd.read_excel(
-            self.report_file, sheet_name="CDR Summary By Investor", skiprows=2, engine="openpyxl", dtype=object
+            self.report_file,
+            sheet_name="CDR Summary By Investor",
+            skiprows=2,
+            engine="openpyxl",
+            dtype=object,
         )
+
         self.investor_entry_df = pd.read_excel(
-            self.cdr_file, sheet_name="investor_format", engine="openpyxl", dtype=object
+            self.cdr_file,
+            sheet_name="investor_format",
+            engine="openpyxl",
+            dtype=object,
         )
-        # Try to load generic sheets; change indices/names as required
-        self.conn_df = pd.read_excel(self.cdr_file, sheet_name=0, engine="openpyxl", dtype=object)
-        self.conn_df = self.conn_df.loc[:, ~self.conn_df.columns.str.contains("^Unnamed")]
-        try:
-            self.investor_allocation_df = pd.read_excel(
-                self.cdr_file, sheet_name="allocation_data", engine="openpyxl", dtype=object
-            )
-        except Exception:
-            self.investor_allocation_df = pd.DataFrame()
+
+        self.conn_df = (
+            pd.read_excel(self.cdr_file, sheet_name=9, engine="openpyxl", dtype=object)
+            .loc[:, lambda df: ~df.columns.str.contains("^Unnamed")]
+            .copy()
+        )
+
+        self.investor_allocation_df = pd.read_excel(
+            self.cdr_file,
+            sheet_name="allocation_data",
+            engine="openpyxl",
+            dtype=object,
+        )
+
         self.log_debug("Data loading completed.")
 
+    # ------------------------
+    # Step 2: Preprocess data
+    # ------------------------
     def preprocess_data(self):
         self.log_debug("Starting data preprocessing.")
-        # Normalization helpers
+
         normalize = lambda s: s.astype(str).str.upper().str.replace(r"\s+", "", regex=True)
 
-        # Create normalized ID columns
-        if "Investor ID" in self.investor_entry_df.columns:
-            self.investor_entry_df["Normalized Investor ID"] = normalize(self.investor_entry_df["Investor ID"])
-        if "Investran Acct ID" in self.conn_df.columns:
-            self.conn_df["Normalized Investor ID"] = normalize(self.conn_df["Investran Acct ID"])
+        # Normalize IDs
+        self.investor_entry_df["Normalized Investor ID"] = normalize(
+            self.investor_entry_df["Investor ID"]
+        )
+        self.conn_df["Normalized Investor ID"] = normalize(self.conn_df["Investran Acct ID"])
 
-        # Example mapping: Bin ID and Commitment Amount from conn_df
-        if {"Normalized Investor ID", "Bin ID"}.issubset(self.conn_df.columns):
-            bin_id_map = dict(zip(self.conn_df["Normalized Investor ID"], self.conn_df["Bin ID"]))
-            self.investor_entry_df["Bin ID"] = self.investor_entry_df.get("Normalized Investor ID", pd.Series()).map(bin_id_map)
+        # Mapping BIN and Commitment
+        bin_id_map = dict(
+            zip(self.conn_df["Normalized Investor ID"], self.conn_df["Bin ID"])
+        )
+        commitment_map = dict(
+            zip(self.conn_df["Normalized Investor ID"], self.conn_df["Commitment Amount"])
+        )
 
-        if {"Normalized Investor ID", "Commitment Amount"}.issubset(self.conn_df.columns):
-            commitment_map = dict(zip(self.conn_df["Normalized Investor ID"], self.conn_df["Commitment Amount"]))
-            self.investor_entry_df["Commitment"] = self.investor_entry_df.get("Normalized Investor ID", pd.Series()).map(commitment_map)
+        self.investor_entry_df["Bin ID"] = self.investor_entry_df[
+            "Normalized Investor ID"
+        ].map(bin_id_map)
+        self.investor_entry_df["Commitment"] = self.investor_entry_df[
+            "Normalized Investor ID"
+        ].map(commitment_map)
 
-        # Normalize account numbers on CDR summary for joins
-        acct_col = next((c for c in self.cdr_summary_df.columns if "Account" in str(c)), None)
-        if acct_col:
-            self.cdr_summary_df["Normalized Account Number"] = normalize(self.cdr_summary_df[acct_col].astype(str))
+        # Normalize Bin IDs
+        self.investor_entry_df["Normalized Bin ID"] = normalize(
+            self.investor_entry_df["Bin ID"]
+        )
+        self.cdr_summary_df["Normalized Account Number"] = normalize(
+            self.cdr_summary_df["Account Number"]
+        )
 
-        # Filter and dedupe CDR summary (example)
-        filtered = self.cdr_summary_df[~self.cdr_summary_df["Investor Name"].astype(str).str.contains("Total", na=False)]
-        filtered = filtered.dropna(subset=[acct_col]).drop_duplicates(subset=["Normalized Account Number"])
-        # TODO: split contribution/distribution/external columns as in your original code
-        self.cdr_summary_df = filtered
+        # Drop totals and duplicates
+        filtered = self.cdr_summary_df[
+            ~self.cdr_summary_df["Investor Name"].astype(str).str.contains("Total", na=False)
+        ].dropna(subset=["Account Number"])
+        filtered = filtered.drop_duplicates(subset=["Normalized Account Number"])
+
+        # Map contributions, distributions, external expenses
+        contrib_cols = filtered.columns[9:17]
+        dist_cols = filtered.columns[17:25]
+        ext_cols = filtered.columns[25:33]
+
+        # Merge into investor_entry_df
+        for prefix, cols in {
+            "Contributions_": contrib_cols,
+            "Distributions_": dist_cols,
+            "ExternalExpenses_": ext_cols,
+        }.items():
+            tmp = filtered[["Normalized Account Number"] + list(cols)].copy()
+            tmp.rename(columns={"Normalized Account Number": "Normalized Bin ID"}, inplace=True)
+            tmp.rename(columns={c: f"{prefix}{c}" for c in cols}, inplace=True)
+            self.investor_entry_df = self.investor_entry_df.merge(
+                tmp, on="Normalized Bin ID", how="left"
+            )
+
         self.log_debug("Data preprocessing completed.")
 
-    # ---- Sheets generation ----
+    # ---------------------------------
+    # Step 3: Update Commitment Sheet
+    # ---------------------------------
     def update_commitment_sheet(self):
         self.log_debug("Updating Commitment sheet.")
-        # Build lookup dataframe if available
-        if self.cdr_summary_df is None or self.conn_df is None:
-            self.log_debug("Missing dataframes for commitment update.")
-            return
-        # Example simple mapping: normalize lookup keys and create mapping
-        try:
-            lookup = self.cdr_summary_df[["Investor Name", "Account Number", "Investor ID", "Investor Commitment"]].copy()
-        except Exception:
-            lookup = pd.DataFrame()
-        # Normalize and create mapping
-        if not lookup.empty:
-            lookup_keys = self.normalize_keys(lookup.iloc[:, 1])
-            lookup_values = lookup.iloc[:, :3]
-            self.mapping = dict(zip(lookup_keys, lookup_values.to_dict(orient="records")))
-        # Example: add columns to conn_df
-        self.conn_df["GS Commitment"] = self.conn_df.get("Bin ID", pd.Series()).map(self.mapping.get)
-        # Create sheet and write dataframe
-        ws = self.wb.create_sheet(title="Commitment")
-        for r_idx, row in enumerate(dataframe_to_rows(self.conn_df.fillna(""), index=False, header=True), start=1):
+
+        self.lookup_df = self.cdr_summary_df[
+            ["Investor Name", "Account Number", "Investor ID", "Investor Commitment"]
+        ]
+        lookup_keys = self.normalize_keys(self.lookup_df["Account Number"])
+        lookup_values = self.lookup_df["Investor Commitment"]
+        conn_keys_series = self.normalize_keys(self.conn_df["Bin ID"])
+
+        self.mapping = dict(zip(lookup_keys, lookup_values))
+
+        def match_key(key):
+            if key in self.mapping:
+                return self.mapping[key], "-"
+            for lk in lookup_keys:
+                if lk.startswith(key):
+                    return self.mapping[lk], "StartsWith"
+                if key in lk:
+                    return self.mapping[lk], "Contains"
+            return None, "NA"
+
+        matched_results = [match_key(key) for key in conn_keys_series]
+        self.conn_df["GS Commitment"], match_types = zip(*matched_results)
+        self.conn_df["GS Check"] = pd.to_numeric(
+            self.conn_df["GS Commitment"], errors="coerce"
+        ) - pd.to_numeric(self.conn_df["Commitment Amount"], errors="coerce")
+
+        ws_commitment = self.wb.create_sheet(title="Commitment")
+        for r_idx, row in enumerate(
+            dataframe_to_rows(self.conn_df, index=False, header=True), start=1
+        ):
             for c_idx, value in enumerate(row, start=1):
-                ws.cell(row=r_idx, column=c_idx, value=value)
-        self.apply_theme(ws)
+                ws_commitment.cell(row=r_idx, column=c_idx, value=value)
+        self.apply_theme(ws_commitment)
+
         self.log_debug("Commitment sheet updated.")
 
-    def map_columns_to_summary(self, entry_columns: List[str], summary_df: pd.DataFrame) -> Dict[str, Any]:
-        # Map entry columns to summary sums using normalized keys
-        exclude_cols = ["Investor Name", "Investor ID", "Account Number", "Current Net Cashflow"]
-        summary_df = summary_df.dropna(subset=["Account Number"], how="any")
-        summary_sums = summary_df.drop(columns=[c for c in exclude_cols if c in summary_df.columns], errors="ignore").select_dtypes(include="number").sum()
-        normalized_keys = {self.normalize(k): k for k in summary_sums.index}
-        mapped_values = {}
-        for col in entry_columns:
-            norm_col = self.normalize(col)
-            match = next((normalized_keys[k] for k in normalized_keys if (k in norm_col or norm_col in k)), None)
-            mapped_values[col] = summary_sums.get(match, None)
-        return mapped_values
-
+    # ---------------------------------
+    # Step 4: Update Entry Sheet
+    # ---------------------------------
     def update_entry_sheet(self):
-        self.log_debug("Updating Entry sheet.")
-        ws = self.wb.create_sheet(title="Entry")
-        df = self.investor_entry_df.copy()
-        # Remove zero-sum contribution/distribution/ext columns (example)
+        ws_entry = self.wb.create_sheet(title="Entry")
         prefixes = ["Contributions_", "Distributions_", "ExternalExpenses_"]
-        cols_to_check = [col for col in df.columns if any(col.startswith(p) for p in prefixes)]
-        cols_to_remove = [col for col in cols_to_check if pd.to_numeric(df[col], errors="coerce").fillna(0).sum() == 0]
-        df.drop(columns=cols_to_remove, inplace=True, errors="ignore")
+        cols_to_check = [
+            col for col in self.investor_entry_df.columns if any(col.startswith(p) for p in prefixes)
+        ]
+        cols_to_remove = [
+            col
+            for col in cols_to_check
+            if pd.to_numeric(self.investor_entry_df[col], errors="coerce").fillna(0).sum() == 0
+        ]
+        self.investor_entry_df.drop(columns=cols_to_remove, inplace=True, errors="ignore")
 
-        for r_idx, row in enumerate(dataframe_to_rows(df.fillna(""), index=False, header=True), start=1):
+        for r_idx, row in enumerate(
+            dataframe_to_rows(self.investor_entry_df, index=False, header=True), start=1
+        ):
             for c_idx, value in enumerate(row, start=1):
-                ws.cell(row=r_idx, column=c_idx, value=value)
+                ws_entry.cell(row=r_idx, column=c_idx, value=value)
 
-        header_row = [cell.value for cell in ws[1]]
-        # Add totals row
-        sum_row_index = ws.max_row + 1
-        ws.cell(row=sum_row_index, column=1, value="Total")
-        for col_idx, col_name in enumerate(header_row, start=1):
-            if col_name and (col_name == "Commitment" or any(col_name.startswith(p) for p in prefixes)):
-                col_letter = get_column_letter(col_idx)
-                formula = f"=SUM({col_letter}2:{col_letter}{sum_row_index-1})"
-                ws.cell(row=sum_row_index, column=col_idx, value=formula)
-
-        # Subtotals (example using mapping)
-        summary_row_index = sum_row_index + 1
-        ws.cell(row=summary_row_index, column=1, value="Subtotals")
-        mapped_values = self.map_columns_to_summary(header_row, self.cdr_summary_df)
-        for col_idx, col_name in enumerate(header_row, start=1):
-            if col_name == "Commitment":
-                try:
-                    commitment_sum = pd.to_numeric(self.conn_df["Commitment Amount"][:-1], errors="coerce").sum()
-                except Exception:
-                    commitment_sum = None
-                ws.cell(row=summary_row_index, column=col_idx, value=commitment_sum)
-            elif col_name in mapped_values:
-                ws.cell(row=summary_row_index, column=col_idx, value=mapped_values[col_name])
-
-        # Validate row (simple equality check via formula)
-        validate_row_index = summary_row_index + 1
-        ws.cell(row=validate_row_index, column=1, value="Validate")
-        for col_idx in range(2, ws.max_column + 1):
-            col_letter = get_column_letter(col_idx)
-            total_cell = f"{col_letter}{sum_row_index}"
-            subtotals_cell = f"{col_letter}{summary_row_index}"
-            formula = f'=IF({total_cell}={subtotals_cell},"OK","Mismatch")'
-            cell = ws.cell(row=validate_row_index, column=col_idx, value=formula)
-            cell.alignment = Alignment(horizontal="center")
-
-        # Apply fills and theme
-        total_fill = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-        subtotals_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
-        validate_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-        for col_idx in range(1, ws.max_column + 1):
-            ws.cell(row=sum_row_index, column=col_idx).fill = total_fill
-            ws.cell(row=summary_row_index, column=col_idx).fill = subtotals_fill
-            ws.cell(row=validate_row_index, column=col_idx).fill = validate_fill
-
-        self.apply_theme(ws)
+        self.apply_theme(ws_entry)
         self.log_debug("Entry sheet updated.")
 
+    # ---------------------------------
+    # Step 5: Update Approx Matches
+    # ---------------------------------
     def update_approx_matches_sheet(self):
         self.log_debug("Updating Approx Matches sheet.")
-        conn_keys_series = self.normalize_keys(self.conn_df.get("Bin ID", pd.Series()))
-        lookup_keys = self.normalize_keys(self.lookup_df.iloc[:, 1]) if self.lookup_df is not None and not self.lookup_df.empty else pd.Series()
+        conn_keys_series = self.normalize_keys(self.conn_df["Bin ID"])
+        lookup_keys = self.normalize_keys(self.lookup_df["Account Number"])
+
         approx_matches = []
         for key in conn_keys_series:
-            found = next((lk for lk in lookup_keys if lk.startswith(key) or key in lk), None)
-            if found and self.mapping.get(found):
-                approx_matches.append({"Conn Key": key, "Matched Lookup Key": found, "Mapped Value": self.mapping.get(found)})
+            for lk in lookup_keys:
+                if lk.startswith(key) or key in lk:
+                    approx_matches.append(
+                        {
+                            "Conn Key": key,
+                            "Matched Lookup Key": lk,
+                            "Mapped Value": self.mapping.get(lk),
+                        }
+                    )
+                    break
 
         if approx_matches:
             approx_df = pd.DataFrame(approx_matches)
-            ws = self.wb.create_sheet(title="Approx Matches")
-            for r_idx, row in enumerate(dataframe_to_rows(approx_df.fillna(""), index=False, header=True), start=1):
+            ws_approx = self.wb.create_sheet(title="Approx Matches")
+            for r_idx, row in enumerate(
+                dataframe_to_rows(approx_df, index=False, header=True), start=1
+            ):
                 for c_idx, value in enumerate(row, start=1):
-                    ws.cell(row=r_idx, column=c_idx, value=value)
-            self.apply_theme(ws)
-            self.log_debug("Approx Matches sheet updated.")
+                    ws_approx.cell(row=r_idx, column=c_idx, value=value)
+            self.apply_theme(ws_approx)
 
-    # ---- Orchestration ----
+        self.log_debug("Approx Matches sheet updated.")
+
+    # ---------------------------------
+    # Step 6: Run Full Processing
+    # ---------------------------------
     def backend_process(self):
         self.log_debug("Starting Excel processing workflow.")
         self.load_data()
         self.preprocess_data()
+        self.wb = load_workbook(filename=self.report_file)
 
-        # Load workbook (copy of report file to be modified)
-        try:
-            self.wb = load_workbook(filename=self.report_file)
-        except Exception:
-            self.wb = Workbook()
-
-        # Remove existing target sheets if present
-        for sheet in ["Commitment", "Approx Matches", "Entry"]:
+        for sheet in ["Commitment", "Entry", "Approx Matches"]:
             if sheet in self.wb.sheetnames:
                 self.wb.remove(self.wb[sheet])
 
-        # Run updates in threads (they share self.wb; openpyxl writes are done inside each function)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [
-                executor.submit(self.update_commitment_sheet),
-                executor.submit(self.update_entry_sheet),
-                executor.submit(self.update_approx_matches_sheet),
-            ]
-            # Wait for completion (exceptions will surface here)
-            for f in futures:
-                try:
-                    f.result()
-                except Exception as e:
-                    self.log_debug(f"Worker raised: {e}")
+        with ThreadPoolExecutor() as executor:
+            executor.submit(self.update_commitment_sheet)
+            executor.submit(self.update_entry_sheet)
+            executor.submit(self.update_approx_matches_sheet)
 
-        # Save output
         self.wb.save(self.output_file)
         self.log_debug(f"Updated workbook saved to {self.output_file}")
