@@ -55,7 +55,7 @@ class ExcelBackendProcessor:
         self.log_debug("Loading data...")
 
         self.cdr_summary_df = pd.read_excel(
-            self.report_file,
+            self.cdr_file,
             sheet_name="CDR Summary By Investor",
             skiprows=2,
             engine="openpyxl",
@@ -77,10 +77,10 @@ class ExcelBackendProcessor:
         if not self.section_dfs:
             self.section_dfs = [self.cdr_summary_df]
 
-        self.investern_entry_df = pd.read_excel(self.cdr_file, sheet_name="investern_format", engine="openpyxl", dtype=object)
-        self.conn_df = pd.read_excel(self.cdr_file, sheet_name=0, engine="openpyxl", dtype=object)
+        self.investern_entry_df = pd.read_excel(self.report_file, sheet_name="investern_format", engine="openpyxl", dtype=object)
+        self.conn_df = pd.read_excel(self.report_file, sheet_name=0, engine="openpyxl", dtype=object)
         self.conn_df = self.conn_df.loc[:, lambda df: df.columns.str.contains("^Unn")]
-        self.investern_allocation_df = pd.read_excel(self.cdr_file, sheet_name="allocation_data", engine="openpyxl", dtype=object)
+        self.investern_allocation_df = pd.read_excel(self.report_file, sheet_name="allocation_data", engine="openpyxl", dtype=object)
 
         self.log_debug("Data loaded successfully.")
 
