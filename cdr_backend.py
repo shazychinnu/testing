@@ -31,7 +31,7 @@ def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
 
-    # ---- 1. CDR Summary (for GS Commitment) ----
+    # ---- 1. Read CDR Summary (for GS Commitment) ----
     cdr = pd.read_excel(
         cdr_file,
         sheet_name="CDR Summary By Investor",
@@ -42,28 +42,31 @@ def create_commitment_sheet():
     cdr["Account Number"] = cdr["Account Number"].astype(str).str.strip()
     cdr["Investor ID"] = cdr["Investor ID"].astype(str).str.strip().str.upper()
 
+    # Map Account Number → Investor Commitment
     acct_to_commitment = cdr.set_index("Account Number")["Investor Commitment"].to_dict()
 
-    # ---- 2. Data_format ----
+    # ---- 2. Read Data_format ----
     df = pd.read_excel(wizard_file, sheet_name="Data_format", engine="openpyxl")
     df.columns = df.columns.str.strip()
 
     # Validate required columns
-    required = ["Legal Entity", "Investran Acct ID", "Commitment Amount"]
+    required = ["Legal Entity", "Bin ID", "Investran Acct ID", "Commitment Amount"]
     for col in required:
         if col not in df.columns:
             raise KeyError(f"❌ Missing required column '{col}' in Data_format sheet.")
 
-    df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip()
+    df["Bin ID"] = df["Bin ID"].astype(str).str.strip()
+    df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip().str.upper()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
 
+    # Detect subtotal rows
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
 
-    # ---- 3. GS Commitment ----
+    # ---- 3. GS Commitment (Bin ID ↔ Account Number) ----
     df["GS Commitment"] = pd.NA
-    valid_gs = (~subtotal_mask) & df["Investran Acct ID"].ne("")
-    df.loc[valid_gs, "GS Commitment"] = df.loc[valid_gs, "Investran Acct ID"].map(acct_to_commitment)
+    valid_gs = (~subtotal_mask) & df["Bin ID"].ne("")
+    df.loc[valid_gs, "GS Commitment"] = df.loc[valid_gs, "Bin ID"].map(acct_to_commitment)
 
     # Compute subtotals
     sub_idxs = df.index[subtotal_mask].tolist()
@@ -78,7 +81,9 @@ def create_commitment_sheet():
 
     # Blank GS for subtotal rows
     df.loc[subtotal_mask, "GS Commitment"] = pd.NA
-    df["GS Check"] = df["Commitment Amount"] - pd.to_numeric(df["GS Commitment"], errors="coerce")
+    df["GS Check"] = pd.to_numeric(df["Commitment Amount"], errors="coerce") - pd.to_numeric(
+        df["GS Commitment"], errors="coerce"
+    )
 
     # ---- 4. SS Commitment (Investran Acct ID ↔ Investor ID) ----
     ss_map = df.set_index("Investran Acct ID")["Commitment Amount"].to_dict()
