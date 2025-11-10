@@ -7,9 +7,10 @@ output_file = "output.xlsx"
 
 
 # ---------------------------------------------------------
-# Utilities
+# Utility functions
 # ---------------------------------------------------------
 def ensure_output_file_exists():
+    """Ensure output file exists."""
     try:
         load_workbook(output_file)
     except FileNotFoundError:
@@ -17,6 +18,7 @@ def ensure_output_file_exists():
 
 
 def delete_sheet_if_exists(path, sheet_name):
+    """Remove existing sheet to avoid duplicates."""
     wb = load_workbook(path)
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -25,13 +27,13 @@ def delete_sheet_if_exists(path, sheet_name):
 
 
 # ---------------------------------------------------------
-# Step 1: Commitment Sheet
+# Step 1: Create Commitment Sheet
 # ---------------------------------------------------------
 def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
 
-    # ---- 1. Read CDR Summary (for GS Commitment) ----
+    # --- 1. Load CDR Summary (for GS Commitment) ---
     cdr = pd.read_excel(
         cdr_file,
         sheet_name="CDR Summary By Investor",
@@ -42,33 +44,30 @@ def create_commitment_sheet():
     cdr["Account Number"] = cdr["Account Number"].astype(str).str.strip()
     cdr["Investor ID"] = cdr["Investor ID"].astype(str).str.strip().str.upper()
 
-    # Map Account Number → Investor Commitment
     acct_to_commitment = cdr.set_index("Account Number")["Investor Commitment"].to_dict()
 
-    # ---- 2. Read Data_format ----
+    # --- 2. Load Data_format ---
     df = pd.read_excel(wizard_file, sheet_name="Data_format", engine="openpyxl")
     df.columns = df.columns.str.strip()
 
-    # Validate required columns
     required = ["Legal Entity", "Bin ID", "Investran Acct ID", "Commitment Amount"]
     for col in required:
         if col not in df.columns:
-            raise KeyError(f"❌ Missing required column '{col}' in Data_format sheet.")
+            raise KeyError(f"❌ Missing required column '{col}' in Data_format.")
 
     df["Bin ID"] = df["Bin ID"].astype(str).str.strip()
     df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip().str.upper()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
 
-    # Detect subtotal rows
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
 
-    # ---- 3. GS Commitment (Bin ID ↔ Account Number) ----
+    # --- 3. GS Commitment (Bin ID ↔ Account Number) ---
     df["GS Commitment"] = pd.NA
-    valid_gs = (~subtotal_mask) & df["Bin ID"].ne("")
+    valid_gs = (~subtotal_mask) & df["Bin ID"].ne("") & df["Bin ID"].notna()
     df.loc[valid_gs, "GS Commitment"] = df.loc[valid_gs, "Bin ID"].map(acct_to_commitment)
 
-    # Compute subtotals
+    # Sum up subtotals
     sub_idxs = df.index[subtotal_mask].tolist()
     if sub_idxs:
         sub_idxs.append(len(df))
@@ -79,25 +78,27 @@ def create_commitment_sheet():
             df.at[idx, "GS Commitment"] = pd.to_numeric(block["GS Commitment"], errors="coerce").sum(skipna=True)
             start = idx + 1
 
-    # Blank GS for subtotal rows
     df.loc[subtotal_mask, "GS Commitment"] = pd.NA
-    df["GS Check"] = pd.to_numeric(df["Commitment Amount"], errors="coerce") - pd.to_numeric(
-        df["GS Commitment"], errors="coerce"
-    )
+    df["GS Check"] = df["Commitment Amount"] - pd.to_numeric(df["GS Commitment"], errors="coerce")
 
-    # ---- 4. SS Commitment (Investran Acct ID ↔ Investor ID) ----
-    ss_map = df.set_index("Investran Acct ID")["Commitment Amount"].to_dict()
-
+    # --- 4. SS Commitment (Investran Acct ID ↔ Investor ID) ---
     investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
     investern.columns = investern.columns.str.strip()
     investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
     investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce")
 
+    # Build mapping using Investran Acct ID as key (exclude blanks)
+    df_nonblank = df[df["Investran Acct ID"].notna() & (df["Investran Acct ID"] != "")]
+    ss_map = df_nonblank.set_index("Investran Acct ID")["Commitment Amount"].to_dict()
+
+    # Apply only if investor has a valid matching Investran Acct ID
     investern["SS Commitment"] = investern["Investor ID"].map(ss_map)
+    investern.loc[investern["Investor ID"].isna() | (investern["Investor ID"] == ""), "SS Commitment"] = pd.NA
     investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce")
+
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 5. Add final subtotal row (SS total) ----
+    # --- 5. Add subtotal row for SS total ---
     subtotal_row = {
         "Vehicle/Investor": "Subtotal (SS Total)",
         "Investor ID": "",
@@ -108,13 +109,13 @@ def create_commitment_sheet():
     }
     investern = pd.concat([investern, pd.DataFrame([subtotal_row])], ignore_index=True)
 
-    # ---- 6. Combine left & right ----
+    # --- 6. Combine both sides ---
     max_rows = max(len(df), len(investern))
     spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)})
 
-    left = df.reindex(range(max_rows)).reset_index(drop=True)
-    right = investern.reindex(range(max_rows)).reset_index(drop=True)
-    combined_df = pd.concat([left, spacer, right], axis=1)
+    df = df.reindex(range(max_rows)).reset_index(drop=True)
+    investern = investern.reindex(range(max_rows)).reset_index(drop=True)
+    combined_df = pd.concat([df, spacer, investern], axis=1)
 
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as w:
         combined_df.to_excel(w, sheet_name="Commitment Sheet", index=False)
@@ -124,7 +125,7 @@ def create_commitment_sheet():
 
 
 # ---------------------------------------------------------
-# Step 2: Entry Sheet
+# Step 2: Create Entry Sheet
 # ---------------------------------------------------------
 def create_entry_sheet_with_subtotals(commitment_df):
     delete_sheet_if_exists(output_file, "Entry")
@@ -180,7 +181,7 @@ def create_entry_sheet_with_subtotals(commitment_df):
 
 
 # ---------------------------------------------------------
-# Main
+# Main Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
     commitment_df = create_commitment_sheet()
