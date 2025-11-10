@@ -1,13 +1,10 @@
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor  # REMOVED USAGE, could be deleted
 
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
-
 
 class ExcelBackendProcessor:
     """
@@ -57,8 +54,8 @@ class ExcelBackendProcessor:
         if self.log_callback:
             try:
                 self.log_callback("DEBUG", message)
-            except Exception:
-                pass
+            except Exception as err:
+                logging.warning(f"Error in log_callback: {err}")
         logging.debug(message)
 
     def normalize_keys(self, series: pd.Series) -> pd.Series:
@@ -108,7 +105,7 @@ class ExcelBackendProcessor:
         self.log_debug("Loading data from Excel files.")
 
         self.cdr_summary_df = pd.read_excel(
-            self.report_file,
+            self.cdr_file,
             sheet_name="CDR Summary By Investor",
             skiprows=2,
             engine="openpyxl",
@@ -116,20 +113,20 @@ class ExcelBackendProcessor:
         )
 
         self.investor_entry_df = pd.read_excel(
-            self.cdr_file,
-            sheet_name="investor_format",
+            self.report_file,
+            sheet_name="investern_format",
             engine="openpyxl",
             dtype=object,
         )
 
         self.conn_df = (
-            pd.read_excel(self.cdr_file, sheet_name=9, engine="openpyxl", dtype=object)
+            pd.read_excel(self.report_file, sheet_name=0, engine="openpyxl", dtype=object)
             .loc[:, lambda df: ~df.columns.str.contains("^Unnamed")]
             .copy()
         )
 
         self.investor_allocation_df = pd.read_excel(
-            self.cdr_file,
+            self.report_file,
             sheet_name="allocation_data",
             engine="openpyxl",
             dtype=object,
@@ -144,6 +141,16 @@ class ExcelBackendProcessor:
         self.log_debug("Starting data preprocessing.")
 
         normalize = lambda s: s.astype(str).str.upper().str.replace(r"\s+", "", regex=True)
+
+        # Ensure required columns exist before proceeding
+        for required_df, required_cols in [
+            (self.investor_entry_df, ["Investor ID"]),
+            (self.conn_df, ["Investran Acct ID", "Bin ID", "Commitment Amount"]),
+            (self.cdr_summary_df, ["Account Number", "Investor Name"]),
+        ]:
+            for col in required_cols:
+                if col not in required_df.columns:
+                    raise KeyError(f"Missing expected column: {col} in dataframe.")
 
         # Normalize IDs
         self.investor_entry_df["Normalized Investor ID"] = normalize(
@@ -180,10 +187,11 @@ class ExcelBackendProcessor:
         ].dropna(subset=["Account Number"])
         filtered = filtered.drop_duplicates(subset=["Normalized Account Number"])
 
-        # Map contributions, distributions, external expenses
-        contrib_cols = filtered.columns[9:17]
-        dist_cols = filtered.columns[17:25]
-        ext_cols = filtered.columns[25:33]
+        # Defensive column slice
+        num_cols = len(filtered.columns)
+        contrib_cols = filtered.columns[9:17] if num_cols >= 17 else []
+        dist_cols = filtered.columns[17:25] if num_cols >= 25 else []
+        ext_cols = filtered.columns[25:33] if num_cols >= 33 else []
 
         # Merge into investor_entry_df
         for prefix, cols in {
@@ -191,12 +199,13 @@ class ExcelBackendProcessor:
             "Distributions_": dist_cols,
             "ExternalExpenses_": ext_cols,
         }.items():
-            tmp = filtered[["Normalized Account Number"] + list(cols)].copy()
-            tmp.rename(columns={"Normalized Account Number": "Normalized Bin ID"}, inplace=True)
-            tmp.rename(columns={c: f"{prefix}{c}" for c in cols}, inplace=True)
-            self.investor_entry_df = self.investor_entry_df.merge(
-                tmp, on="Normalized Bin ID", how="left"
-            )
+            if cols is not None and len(cols) > 0:
+                tmp = filtered[["Normalized Account Number"] + list(cols)].copy()
+                tmp.rename(columns={"Normalized Account Number": "Normalized Bin ID"}, inplace=True)
+                tmp.rename(columns={c: f"{prefix}{c}" for c in cols}, inplace=True)
+                self.investor_entry_df = self.investor_entry_df.merge(
+                    tmp, on="Normalized Bin ID", how="left"
+                )
 
         self.log_debug("Data preprocessing completed.")
 
@@ -312,10 +321,10 @@ class ExcelBackendProcessor:
             if sheet in self.wb.sheetnames:
                 self.wb.remove(self.wb[sheet])
 
-        with ThreadPoolExecutor() as executor:
-            executor.submit(self.update_commitment_sheet)
-            executor.submit(self.update_entry_sheet)
-            executor.submit(self.update_approx_matches_sheet)
+        # Run sequentially! No threads. (Threading would corrupt workbook output)
+        self.update_commitment_sheet()
+        self.update_entry_sheet()
+        self.update_approx_matches_sheet()
 
         self.wb.save(self.output_file)
         self.log_debug(f"Updated workbook saved to {self.output_file}")
