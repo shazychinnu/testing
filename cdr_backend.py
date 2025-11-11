@@ -17,7 +17,6 @@ def ensure_output_file_exists():
     except FileNotFoundError:
         Workbook().save(output_file)
 
-
 def delete_sheet_if_exists(path, sheet_name):
     """Delete sheet if it already exists."""
     wb = load_workbook(path)
@@ -25,7 +24,6 @@ def delete_sheet_if_exists(path, sheet_name):
         del wb[sheet_name]
         wb.save(path)
     wb.close()
-
 
 def norm_key(x) -> str:
     """Normalize keys for consistent matching."""
@@ -36,7 +34,6 @@ def norm_key(x) -> str:
     s = re.sub(r"[ ,\-]", "", s)
     return s.upper()
 
-
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Replace all NaN, <NA>, None, NULL, etc. with blank and convert to object dtype."""
     df = df.replace(
@@ -44,7 +41,6 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         value=""
     )
     return df.astype(object)
-
 
 # ---------------------------------------------------------
 # Step 1: Create Commitment Sheet
@@ -63,7 +59,7 @@ def create_commitment_sheet():
     cdr.columns = cdr.columns.str.strip()
     cdr["Account Number"] = cdr["Account Number"].apply(norm_key)
     cdr["Investor Commitment"] = pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
-    acctnorm_to_commitment = cdr.set_index("Account Number")["Investor Commitment"].to_dict()
+    acct_to_commit = cdr.set_index("Account Number")["Investor Commitment"].to_dict()
 
     # ---- 2. Load Data_format ----
     df = pd.read_excel(wizard_file, sheet_name="Data_format", engine="openpyxl")
@@ -76,7 +72,7 @@ def create_commitment_sheet():
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
 
     # ---- 3. GS Commitment ----
-    df["GS Commitment"] = df["_bin_norm"].map(acctnorm_to_commitment)
+    df["GS Commitment"] = df["_bin_norm"].map(acct_to_commit)
     df.loc[subtotal_mask, "GS Commitment"] = np.nan
     df["GS Commitment"] = pd.to_numeric(df["GS Commitment"], errors="coerce").fillna(0)
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
@@ -120,24 +116,20 @@ def create_commitment_sheet():
         "SS Commitment": ss_total_commit,
         "SS Check": ss_total_check,
     })
-    subtotal_df = pd.DataFrame([subtotal_row], dtype=object)
-    combined_df = pd.concat([combined_df, subtotal_df], ignore_index=True)
+    combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row], dtype=object)], ignore_index=True)
 
-    # ---- 7. Blank SS values where Investor ID missing ----
-    combined_df["Investor ID"] = combined_df["Investor ID"].astype(str).str.strip().str.upper()
-    mask_blank = combined_df["Investor ID"].isin(["", "NAN", "NONE", "NULL"]) | combined_df["Investor ID"].isna()
-    for col in ["SS Commitment", "SS Check", "Invester Commitment"]:
-        if col in combined_df.columns:
-            combined_df.loc[mask_blank, col] = ""
+    # ---- 7. Remove helper columns before writing ----
+    internal_cols = [c for c in combined_df.columns if c.startswith("_")]
+    combined_df.drop(columns=internal_cols, inplace=True, errors="ignore")
 
-    # ---- 8. Clean all NaNs for Excel ----
+    # ---- 8. Final cleanup ----
     combined_df = clean_dataframe(combined_df)
 
     # ---- 9. Write clean sheet ----
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
-    print("✅ Commitment Sheet created successfully — no NaN, no float+str errors.")
+    print("✅ Commitment Sheet created successfully — no NaN, no float+str errors, no helper columns.")
     return combined_df
 
 
@@ -191,18 +183,19 @@ def create_entry_sheet_with_subtotals(commitment_df):
     final_df["Bin ID"] = final_df["_id_norm"].map(id_to_bin)
     final_df["Commitment Amount"] = final_df["_id_norm"].map(id_to_amt)
 
+    # ---- Remove helper columns and clean ----
+    final_df.drop(columns=[c for c in final_df.columns if c.startswith("_")], inplace=True, errors="ignore")
     final_df = clean_dataframe(final_df)
 
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         final_df.to_excel(writer, sheet_name="Entry", index=False)
 
-    print("✅ Entry Sheet created successfully — clean, validated.")
-
+    print("✅ Entry Sheet created successfully — clean and validated.")
 
 # ---------------------------------------------------------
-# Main Execution
+# Main
 # ---------------------------------------------------------
 if __name__ == "__main__":
     commitment_df = create_commitment_sheet()
     create_entry_sheet_with_subtotals(commitment_df)
-    print("🎯 Automation completed successfully — all sheets validated, no NaN, no float+str errors.")
+    print("🎯 Automation completed successfully — all sheets clean, validated, and error-free!")
