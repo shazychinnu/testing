@@ -1,132 +1,87 @@
 import pandas as pd
 
+def create_entry_sheet_with_subtotals(commitment_df, wizard_file, cdr_file_data, output_file):
+    """
+    Create an 'Entry' sheet in the output Excel file, combining data from wizard and commitment files,
+    calculating subtotals per block, and joining commitment and BIN mapping data.
+    """
+    
+    # --- Helper function to normalize keys ---
+    def norm_key(x):
+        if pd.isna(x):
+            return ""
+        return str(x).strip().upper()
 
-class ExcelBackend:
-    def __init__(self):
-        self.df = None  # Placeholder for the Excel data
+    # --- Delete existing sheet if it exists ---
+    delete_sheet_if_exists(output_file, "Entry")
 
-    def load_excel_file(self, file_path):
-        """Load an Excel file and return sheet names."""
-        if not file_path:
-            return None
+    # --- Load raw data from wizard file ---
+    df_raw = pd.read_excel(wizard_file, sheet_name="allocation_data", engine="openpyxl", header=None)
+    cdr = cdr_file_data.copy()
 
-        self.df = pd.read_excel(file_path, sheet_name=None)  # Load all sheets
-        return list(self.df.keys()) if self.df else None
+    # --- Identify table headers ---
+    header_rows = df_raw.index[df_raw.iloc[:, 0].astype(str) == "Vehicle/Investor"].tolist()
+    tables = []
 
-    def get_sheet_data(self, sheet_name):
-        """Retrieve data for a specific sheet."""
-        if self.df and sheet_name in self.df:
-            return self.df[sheet_name]
-        return None
+    for i, h in enumerate(header_rows):
+        start = h
+        end = header_rows[i + 1] if i + 1 < len(header_rows) else len(df_raw)
+        block = df_raw.iloc[start:end].reset_index(drop=True)
 
-    def download_data(self, sheet_name, save_path):
-        """Save the selected sheet's data to a file."""
-        if self.df and sheet_name in self.df:
-            data_to_save = self.df[sheet_name]
-            data_to_save.to_excel(save_path, index=False)
-            return True
-        return False
-==============================================================
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from sample import ExcelBackend  # Import backend class
+        # First row = column headers
+        block.columns = block.iloc[0]
+        block = block.drop(0).reset_index(drop=True)
 
+        # --- Calculate subtotal if "Final LE Amount" column exists ---
+        if "Final LE Amount" in block.columns:
+            block["Final LE Amount"] = pd.to_numeric(block["Final LE Amount"], errors="coerce").fillna(0)
+            subtotal_val = block["Final LE Amount"].sum(skipna=True)
+        else:
+            subtotal_val = 0
 
-class ExcelApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Excel Data Viewer")
-        self.root.geometry("800x600")
+        # --- Add subtotal row ---
+        subtotal_row = {col: "" for col in block.columns}
+        subtotal_row[block.columns[0]] = "Subtotal"
+        if "Final LE Amount" in block.columns:
+            subtotal_row["Final LE Amount"] = subtotal_val
 
-        # Backend instance
-        self.backend = ExcelBackend()
+        block = pd.concat([block, pd.DataFrame([subtotal_row])], ignore_index=True)
+        tables.append(block)
 
-        # Frame for the dropdown and data display
-        self.frame = tk.Frame(self.root)
-        self.frame.pack(fill=tk.BOTH, expand=True)
+    # --- Combine all tables ---
+    final_df = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
 
-        # Dropdown for sheet selection
-        self.sheet_label = tk.Label(self.frame, text="Select Sheet:")
-        self.sheet_label.pack(side=tk.TOP, padx=10, pady=5)
+    # --- Normalize ID columns ---
+    id_col = "Investor ID" if "Investor ID" in final_df.columns else "Investor Id"
+    final_df["_id_norm"] = final_df[id_col].apply(norm_key)
 
-        self.sheet_dropdown = ttk.Combobox(self.frame, state="readonly")
-        self.sheet_dropdown.pack(side=tk.TOP, padx=10, pady=5)
-        self.sheet_dropdown.bind("<<ComboboxSelected>>", self.load_sheet_data)
+    cm = commitment_df.copy()
+    cm["_inv_acct_norm"] = cm["Investran Acct ID"].apply(norm_key)
+    cdr["_bin_id_form"] = cdr["Account Number"].apply(norm_key)
 
-        # Treeview widget for displaying the data
-        self.tree = ttk.Treeview(self.frame, show="headings")
-        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    # --- Map normalized account ID to BIN ID ---
+    id_to_bin = (
+        cm.dropna(subset=["Bin ID"])
+        .drop_duplicates(subset=["_inv_acct_norm"])
+        .set_index("_inv_acct_norm")["Bin ID"]
+        .to_dict()
+    )
 
-        # Scrollbars for Treeview
-        self.x_scrollbar = ttk.Scrollbar(self.frame, orient="horizontal", command=self.tree.xview)
-        self.x_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.y_scrollbar = ttk.Scrollbar(self.frame, orient="vertical", command=self.tree.yview)
-        self.y_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    cm["_inv_acct_norm"] = cm["_inv_acct_norm"].astype(str).fillna("").str.strip().str.upper()
+    cm["Commitment Amount"] = pd.to_numeric(cm["Commitment Amount"], errors="coerce").fillna(0)
 
-        self.tree.configure(xscrollcommand=self.x_scrollbar.set, yscrollcommand=self.y_scrollbar.set)
+    final_df["Bin ID"] = final_df["_id_norm"].map(id_to_bin)
 
-        # Load the Excel file
-        self.load_excel_file_button = tk.Button(self.root, text="Load Excel File", command=self.load_excel_file)
-        self.load_excel_file_button.pack(side=tk.BOTTOM, padx=10, pady=10)
+    cdr["_bin_id_form"] = cdr["_bin_id_form"].astype(str).fillna("").str.strip().str.upper()
+    id_to_amt = cdr.groupby("_bin_id_form")["Investor Commitment"].sum().to_dict()
+    final_df["Commitment Amount"] = final_df["Bin ID"].map(id_to_amt)
 
-        # Button to download data
-        self.download_button = tk.Button(self.root, text="Download Data", command=self.download_data)
-        self.download_button.pack(side=tk.BOTTOM, padx=10, pady=10)
+    # --- Remove helper columns and clean ---
+    final_df.drop(columns=[c for c in final_df.columns if c.startswith("_")], inplace=True, errors="ignore")
+    final_df = clean_dataframe(final_df)
 
-    def load_excel_file(self):
-        """Open file dialog to load an Excel file and populate sheet dropdown."""
-        file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx;*.xls")])
-        if not file_path:
-            return
+    # --- Write to Excel ---
+    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
+        final_df.to_excel(writer, sheet_name="Entry", index=False)
 
-        # Load Excel file via backend and get sheet names
-        sheet_names = self.backend.load_excel_file(file_path)
-
-        if sheet_names:
-            # Update dropdown menu with sheet names
-            self.sheet_dropdown['values'] = sheet_names
-            self.sheet_dropdown.current(0)  # Select the first sheet by default
-            self.load_sheet_data()  # Load the first sheet's data automatically
-
-    def load_sheet_data(self, event=None):
-        """Load the data from the selected sheet into the Treeview."""
-        sheet_name = self.sheet_dropdown.get()
-        data = self.backend.get_sheet_data(sheet_name)
-
-        if data is not None:
-            # Clear existing data in the treeview
-            for i in self.tree.get_children():
-                self.tree.delete(i)
-
-            # Set columns and headings
-            self.tree["columns"] = list(data.columns)
-            for col in data.columns:
-                self.tree.heading(col, text=col)
-                self.tree.column(col, width=100, anchor="center")
-
-            # Insert data into treeview
-            for row in data.itertuples(index=False):
-                self.tree.insert("", "end", values=row)
-
-    def download_data(self):
-        """Allow user to download the displayed data as an Excel file."""
-        sheet_name = self.sheet_dropdown.get()
-        if not sheet_name:
-            messagebox.showerror("Error", "No sheet selected. Please load an Excel file first.")
-            return
-
-        # Ask for file save location
-        save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
-        if save_path:
-            success = self.backend.download_data(sheet_name, save_path)
-            if success:
-                messagebox.showinfo("Success", f"Data saved to {save_path}")
-            else:
-                messagebox.showerror("Error", "Failed to save data.")
-
-
-# Running the Tkinter Application
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = ExcelApp(root)
-    root.mainloop()
+    print("Entry Sheet created successfully - clean and validated.")
