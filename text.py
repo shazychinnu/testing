@@ -1,90 +1,115 @@
 import pandas as pd
+import re
+from openpyxl import load_workbook
 
-def create_entry_sheet_with_subtotals(commitment_df):
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def norm_key(x):
+    """Normalize keys for matching (remove .0, spaces, commas, hyphens, etc.)."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[,\-]", "", s)
+    return s.upper()
+
+
+def delete_sheet_if_exists(output_file, sheet_name):
+    """Delete a sheet from the Excel file if it already exists."""
+    try:
+        wb = load_workbook(output_file)
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+            wb.save(output_file)
+    except FileNotFoundError:
+        # File doesn't exist yet — fine for first run
+        pass
+
+
+def clean_dataframe(df):
+    """Basic dataframe cleanup — strip strings and reset index."""
+    df = df.copy()
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Main Function
+# ---------------------------------------------------------------------------
+
+def create_entry_sheet_dynamic(commitment_df, cdr_file_path, output_file):
     """
-    Create an 'Entry' sheet in the output Excel file, combining data from wizard and commitment files,
-    calculating subtotals per block, and joining commitment and BIN mapping data.
+    Dynamically create an 'Entry' sheet using data from the CDR Summary By Investor sheet
+    and commitment mapping. Handles variable headers and duplicate subcolumn names.
     """
-    
-    # --- Helper function to normalize keys ---
-    def norm_key(x):
-        s = str(x).strip()
-        if s.endswith(".0):
-            s = s[:-2]
-        s = s.replace("\u00A0", " ")
-        s = re.sub(r"[,\-]", "", s)
-        return s.upper()
 
-    # --- Delete existing sheet if it exists ---
-    delete_sheet_if_exists(output_file, "Entry")
-
-    # --- Load raw data from wizard file ---
-    df_raw = pd.read_excel(wizard_file, sheet_name="allocation_data", engine="openpyxl", header=None)
-    cdr = cdr_file_data.copy()
-
-    # --- Identify table headers ---
-    header_rows = df_raw.index[df_raw.iloc[:, 0].astype(str) == "Vehicle/Investor"].tolist()
-    tables = []
-
-    for i, h in enumerate(header_rows):
-        start = h
-        end = header_rows[i + 1] if i + 1 < len(header_rows) else len(df_raw)
-        block = df_raw.iloc[start:end].reset_index(drop=True)
-
-        # First row = column headers
-        block.columns = block.iloc[0]
-        block = block.drop(0).reset_index(drop=True)
-
-        # --- Calculate subtotal if "Final LE Amount" column exists ---
-        if "Final LE Amount" in block.columns:
-            block["Final LE Amount"] = pd.to_numeric(block["Final LE Amount"], errors="coerce").fillna(0)
-            subtotal_val = block["Final LE Amount"].sum(skipna=True)
-        else:
-            subtotal_val = 0
-
-        # --- Add subtotal row ---
-        subtotal_row = {col: "" for col in block.columns}
-        subtotal_row[block.columns[0]] = "Subtotal"
-        if "Final LE Amount" in block.columns:
-            subtotal_row["Final LE Amount"] = subtotal_val
-
-        block = pd.concat([block, pd.DataFrame([subtotal_row])], ignore_index=True)
-        tables.append(block)
-
-    # --- Combine all tables ---
-    final_df = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
-
-    # --- Normalize ID columns ---
-    id_col = "Investor ID" if "Investor ID" in final_df.columns else "Investor Id"
-    final_df["_id_norm"] = final_df[id_col].apply(norm_key)
-
-    cm = commitment_df.copy()
-    cm["_inv_acct_norm"] = cm["Investran Acct ID"].apply(norm_key)
-    cdr["_bin_id_form"] = cdr["Account Number"].apply(norm_key)
-
-    # --- Map normalized account ID to BIN ID ---
-    id_to_bin = (
-        cm.dropna(subset=["Bin ID"])
-        .drop_duplicates(subset=["_inv_acct_norm"])
-        .set_index("_inv_acct_norm")["Bin ID"]
-        .to_dict()
+    # -----------------------------------------------------------------------
+    # STEP 1: Read and flatten multi-level CDR Summary By Investor headers
+    # -----------------------------------------------------------------------
+    cdr_df = pd.read_excel(
+        cdr_file_path,
+        sheet_name="CDR Summary By Investor",
+        header=[0, 1],  # Two header rows
+        engine="openpyxl"
     )
 
-    cm["_inv_acct_norm"] = cm["_inv_acct_norm"].astype(str).fillna("").str.strip().str.upper()
-    cm["Commitment Amount"] = pd.to_numeric(cm["Commitment Amount"], errors="coerce").fillna(0)
+    # --- Flatten column names dynamically ---
+    flattened_columns = []
+    for lvl1, lvl2 in cdr_df.columns:
+        # Handle Unnamed or empty secondary headers
+        if pd.isna(lvl2) or str(lvl2).startswith("Unnamed"):
+            flat_name = str(lvl1).strip().replace(" ", "_")
+        else:
+            flat_name = f"{str(lvl1).strip()}_{str(lvl2).strip()}".replace(" ", "_")
+        flattened_columns.append(flat_name)
 
-    final_df["Bin ID"] = final_df["_id_norm"].map(id_to_bin)
+    cdr_df.columns = flattened_columns
 
-    cdr["_bin_id_form"] = cdr["_bin_id_form"].astype(str).fillna("").str.strip().str.upper()
-    id_to_amt = cdr.groupby("_bin_id_form")["Investor Commitment"].sum().to_dict()
-    final_df["Commitment Amount"] = final_df["Bin ID"].map(id_to_amt)
+    # -----------------------------------------------------------------------
+    # STEP 2: Normalize keys for joining
+    # -----------------------------------------------------------------------
+    # Ensure Bin ID exists (or similar)
+    possible_bin_cols = [col for col in cdr_df.columns if "Bin" in col or "BIN" in col]
+    if not possible_bin_cols:
+        raise ValueError("CDR Summary sheet must contain a 'Bin ID' or similar column.")
+    bin_col = possible_bin_cols[0]  # Use the first detected Bin ID column
 
-    # --- Remove helper columns and clean ---
-    final_df.drop(columns=[c for c in final_df.columns if c.startswith("_")], inplace=True, errors="ignore")
-    final_df = clean_dataframe(final_df)
+    cdr_df[bin_col] = cdr_df[bin_col].apply(norm_key)
+    commitment_df["Bin_ID"] = commitment_df["Bin ID"].apply(norm_key)
 
-    # --- Write to Excel ---
+    # -----------------------------------------------------------------------
+    # STEP 3: Merge commitment and CDR data on Bin ID
+    # -----------------------------------------------------------------------
+    merged_df = pd.merge(commitment_df, cdr_df, left_on="Bin_ID", right_on=bin_col, how="left")
+    merged_df.fillna(0, inplace=True)
+
+    # -----------------------------------------------------------------------
+    # STEP 4: Identify numeric columns dynamically
+    # -----------------------------------------------------------------------
+    numeric_cols = merged_df.select_dtypes(include=["number"]).columns.tolist()
+    main_cols = [c for c in merged_df.columns if c not in numeric_cols]
+
+    # -----------------------------------------------------------------------
+    # STEP 5: Add a grand total row
+    # -----------------------------------------------------------------------
+    totals = merged_df[numeric_cols].sum(numeric_only=True)
+    total_row = pd.DataFrame([[ "TOTAL" ] + [0]*(len(main_cols)-1) + list(totals)], 
+                             columns=main_cols + numeric_cols)
+    entry_df = pd.concat([merged_df, total_row], ignore_index=True)
+
+    # -----------------------------------------------------------------------
+    # STEP 6: Clean and save to Excel
+    # -----------------------------------------------------------------------
+    entry_df = clean_dataframe(entry_df)
+    delete_sheet_if_exists(output_file, "Entry")
+
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
-        final_df.to_excel(writer, sheet_name="Entry", index=False)
+        entry_df.to_excel(writer, sheet_name="Entry", index=False)
 
-    print("Entry Sheet created successfully - clean and validated.")
+    print(f"✅ Entry Sheet created successfully with {len(entry_df)} rows and dynamic columns.")
