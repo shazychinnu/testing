@@ -223,43 +223,73 @@ if __name__ == "__main__":
 
 
 
+def create_entry_sheet_with_subtotals(commitment_df):
+    # DO NOT touch the Commitment sheet; only build Entry sheet
+    delete_sheet_if_exists(output_file, "Entry")
 
-# ---- 4. SS Commitment (Now fetched using Investran Acct ID ↔ Account Number) ----
+    # 1) Read allocation_data and build the stacked table with subtotals (unchanged)
+    df_raw = pd.read_excel(wizard_file, sheet_name="allocation_data", engine="openpyxl", header=None)
+    header_rows = df_raw.index[df_raw.iloc[:, 0].astype(str) == "Vehicle/Investor"].tolist()
+    tables = []
 
-# Step 1: Build Account Number → Investor Commitment mapping from CDR Summary By Investor
-cdr_account_commit_map = (
-    cdr[["Account Number", "Investor Commitment"]]
-    .dropna(subset=["Account Number"])
-    .copy()
-)
-cdr_account_commit_map["Account Number"] = cdr_account_commit_map["Account Number"].astype(str).str.strip().str.upper()
-cdr_account_commit_map["Investor Commitment"] = pd.to_numeric(
-    cdr_account_commit_map["Investor Commitment"], errors="coerce"
-).fillna(0)
+    for i, h in enumerate(header_rows):
+        start = h
+        end = header_rows[i + 1] if i + 1 < len(header_rows) else len(df_raw)
+        block = df_raw.iloc[start:end].reset_index(drop=True)
+        block.columns = block.iloc[0]
+        block = block.drop(0).reset_index(drop=True)
 
-# Create dictionary for mapping
-account_to_commitment = cdr_account_commit_map.set_index("Account Number")["Investor Commitment"].to_dict()
+        if "Final LE Amount" in block.columns:
+            block["Final LE Amount"] = pd.to_numeric(block["Final LE Amount"], errors="coerce").fillna(0)
+            subtotal_val = block["Final LE Amount"].sum(skipna=True)
+        else:
+            subtotal_val = 0
 
-# Step 2: Read Investern Format
-investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
-investern.columns = investern.columns.str.strip()
+        subtotal_row = {col: "" for col in block.columns}
+        subtotal_row[block.columns[0]] = "Subtotal"
+        if "Final LE Amount" in block.columns:
+            subtotal_row["Final LE Amount"] = subtotal_val
 
-# Clean Investor ID
-investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
-investern["Investor ID"] = investern["Investor ID"].replace(
-    to_replace=["NAN", "NONE", "NULL", "<NA>", "NA", "N/A", "PD.NA"], value=""
-)
-investern["Investor ID"] = investern["Investor ID"].where(investern["Investor ID"] != "nan", "")
+        block = pd.concat([block, pd.DataFrame([subtotal_row])], ignore_index=True)
+        tables.append(block)
 
-# Normalize key columns
-investern["_id_norm"] = investern["Investor ID"].apply(lambda x: norm_key(x) if x != "" else "")
-investern["Investran Acct ID"] = investern["Investran Acct ID"].astype(str).str.strip().str.upper()
+    final_df = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
 
-# Step 3: Map SS Commitment using Investran Acct ID → Account Number relationship
-investern["SS Commitment"] = investern["Investran Acct ID"].map(account_to_commitment)
-investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce").fillna(0)
+    # 2) Normalize Investor ID coming from allocation_data
+    id_col = "Investor ID" if "Investor ID" in final_df.columns else "Investor Id"
+    final_df["_id_norm"] = final_df[id_col].apply(norm_key) if id_col in final_df.columns else ""
 
-# Step 4: Calculate SS Check
-investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
-investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
+    # 3) Map Investor ID -> Bin ID from Commitment sheet (working part kept)
+    cm = commitment_df.copy()
+    # commitment_df already has "Investor ID" and "Bin ID"
+    cm["_id_norm"] = cm["Investor ID"].apply(norm_key)
+    id_to_bin_raw = (
+        cm.dropna(subset=["Bin ID"])
+          .drop_duplicates(subset=["_id_norm"])
+          .set_index("_id_norm")["Bin ID"]
+          .to_dict()
+    )
+    # Write Bin ID into Entry sheet
+    final_df["Bin ID"] = final_df["_id_norm"].map(id_to_bin_raw)
+
+    # 4) Build Account Number -> Investor Commitment map from CDR Summary By Investor
+    cdr = pd.read_excel(cdr_file, sheet_name="CDR Summary By Investor", engine="openpyxl", skiprows=2)
+    cdr.columns = cdr.columns.str.strip()
+    cdr["Account Number"] = cdr["Account Number"].astype(str).str.strip().str.upper()
+    cdr["Investor Commitment"] = pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
+    acct_to_commit = cdr.set_index("Account Number")["Investor Commitment"].to_dict()
+
+    # 5) Using the fetched Bin ID (== Account Number), map Commitment Amount from CDR
+    final_df["_bin_norm"] = final_df["Bin ID"].astype(str).str.strip().str.upper()
+    final_df["Commitment Amount"] = final_df["_bin_norm"].map(acct_to_commit)
+
+    # 6) Clean helper columns and NaNs before writing
+    final_df.drop(columns=[c for c in final_df.columns if c.startswith("_")], inplace=True, errors="ignore")
+    final_df = clean_dataframe(final_df)
+
+    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
+        final_df.to_excel(writer, sheet_name="Entry", index=False)
+
+    print("✅ Entry Sheet created successfully — Bin ID via Commitment sheet, Commitment Amount via CDR (Account Number).")
+
 
