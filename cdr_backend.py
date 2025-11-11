@@ -220,3 +220,46 @@ if __name__ == "__main__":
     commitment_df = create_commitment_sheet()
     create_entry_sheet_with_subtotals(commitment_df)
     print("🎯 Automation completed successfully — all sheets clean, validated, and error-free!")
+
+
+
+
+# ---- 4. SS Commitment (Now fetched using Investran Acct ID ↔ Account Number) ----
+
+# Step 1: Build Account Number → Investor Commitment mapping from CDR Summary By Investor
+cdr_account_commit_map = (
+    cdr[["Account Number", "Investor Commitment"]]
+    .dropna(subset=["Account Number"])
+    .copy()
+)
+cdr_account_commit_map["Account Number"] = cdr_account_commit_map["Account Number"].astype(str).str.strip().str.upper()
+cdr_account_commit_map["Investor Commitment"] = pd.to_numeric(
+    cdr_account_commit_map["Investor Commitment"], errors="coerce"
+).fillna(0)
+
+# Create dictionary for mapping
+account_to_commitment = cdr_account_commit_map.set_index("Account Number")["Investor Commitment"].to_dict()
+
+# Step 2: Read Investern Format
+investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
+investern.columns = investern.columns.str.strip()
+
+# Clean Investor ID
+investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
+investern["Investor ID"] = investern["Investor ID"].replace(
+    to_replace=["NAN", "NONE", "NULL", "<NA>", "NA", "N/A", "PD.NA"], value=""
+)
+investern["Investor ID"] = investern["Investor ID"].where(investern["Investor ID"] != "nan", "")
+
+# Normalize key columns
+investern["_id_norm"] = investern["Investor ID"].apply(lambda x: norm_key(x) if x != "" else "")
+investern["Investran Acct ID"] = investern["Investran Acct ID"].astype(str).str.strip().str.upper()
+
+# Step 3: Map SS Commitment using Investran Acct ID → Account Number relationship
+investern["SS Commitment"] = investern["Investran Acct ID"].map(account_to_commitment)
+investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce").fillna(0)
+
+# Step 4: Calculate SS Check
+investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
+investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
+
