@@ -79,21 +79,42 @@ def create_commitment_sheet():
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---- 4. SS Commitment ----
-    ss_source = (
-        df.loc[df["_inv_acct_norm"].ne("") & df["_inv_acct_norm"].notna()]
-        .groupby("_inv_acct_norm")["Commitment Amount"]
-        .sum()
-        .to_dict()
-    )
+    # ---- 4. SS Commitment (Now from CDR Summary By Investor) ----
 
-    investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
-    investern.columns = investern.columns.str.strip()
-    investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
-    investern["_id_norm"] = investern["Investor ID"].apply(norm_key)
-    investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
-    investern["SS Commitment"] = investern["_id_norm"].map(ss_source)
-    investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce").fillna(0)
-    investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
+# Create Investor ID → Investor Commitment mapping from CDR Summary
+cdr_investor_map = (
+    cdr[["Investor ID", "Investor Commitment"]]
+    .dropna(subset=["Investor ID"])
+    .copy()
+)
+cdr_investor_map["Investor ID"] = cdr_investor_map["Investor ID"].astype(str).str.strip().str.upper()
+cdr_investor_map["Investor Commitment"] = pd.to_numeric(cdr_investor_map["Investor Commitment"], errors="coerce").fillna(0)
+investorid_to_commitment = cdr_investor_map.set_index("Investor ID")["Investor Commitment"].to_dict()
+
+# Read Investern Format as before
+investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
+investern.columns = investern.columns.str.strip()
+
+# Clean Investor ID column (retain your working logic)
+investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
+investern["Investor ID"] = investern["Investor ID"].replace(
+    to_replace=["NAN", "NONE", "NULL", "<NA>", "NA", "N/A", "PD.NA"], value=""
+)
+investern["Investor ID"] = investern["Investor ID"].where(investern["Investor ID"] != "nan", "")
+
+# Normalize ID
+investern["_id_norm"] = investern["Investor ID"].apply(lambda x: norm_key(x) if x != "" else "")
+
+# Commitment columns
+investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
+
+# ✅ New SS Commitment mapping: from CDR Summary By Investor sheet
+investern["SS Commitment"] = investern["_id_norm"].map(investorid_to_commitment)
+investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce").fillna(0)
+
+# SS Check (same logic)
+investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
+
 
     # ---- 5. Combine DataFrames ----
     max_rows = max(len(df), len(investern))
