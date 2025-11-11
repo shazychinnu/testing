@@ -1,4 +1,5 @@
 import re
+import numpy as np
 import pandas as pd
 from openpyxl import load_workbook, Workbook
 
@@ -7,7 +8,7 @@ wizard_file = "report_file.xlsx"
 output_file = "output.xlsx"
 
 # ---------------------------------------------------------
-# Utilities
+# Utility functions
 # ---------------------------------------------------------
 def ensure_output_file_exists():
     """Ensure output file exists."""
@@ -27,7 +28,7 @@ def delete_sheet_if_exists(path, sheet_name):
 
 
 def norm_key(x) -> str:
-    """Normalize keys for reliable matching."""
+    """Normalize keys for consistent matching."""
     s = str(x).strip()
     if s.endswith(".0"):
         s = s[:-2]
@@ -43,12 +44,12 @@ def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
 
-    # ---- 1. Load CDR Summary (for GS Commitment) ----
+    # ---- 1. Load CDR Summary By Investor ----
     cdr = pd.read_excel(
         cdr_file,
         sheet_name="CDR Summary By Investor",
         engine="openpyxl",
-        skiprows=2,
+        skiprows=2
     )
     cdr.columns = cdr.columns.str.strip()
     cdr["Account Number"] = cdr["Account Number"].apply(norm_key)
@@ -58,12 +59,6 @@ def create_commitment_sheet():
     # ---- 2. Load Data_format ----
     df = pd.read_excel(wizard_file, sheet_name="Data_format", engine="openpyxl")
     df.columns = df.columns.str.strip()
-
-    required = ["Legal Entity", "Bin ID", "Investran Acct ID", "Commitment Amount"]
-    for col in required:
-        if col not in df.columns:
-            raise KeyError(f"❌ Missing required column '{col}' in Data_format sheet.")
-
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
@@ -71,17 +66,16 @@ def create_commitment_sheet():
 
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
 
-    # ---- 3. GS Commitment (Bin ID ↔ Account Number) ----
+    # ---- 3. GS Commitment (map Bin ID ↔ Account Number) ----
     df["GS Commitment"] = df["_bin_norm"].map(acctnorm_to_commitment)
-    df.loc[subtotal_mask, "GS Commitment"] = pd.NA
+    df.loc[subtotal_mask, "GS Commitment"] = np.nan
     df["GS Commitment"] = pd.to_numeric(df["GS Commitment"], errors="coerce").fillna(0)
-    df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
-    # ---- 4. SS Commitment ----
+    # ---- 4. SS Commitment logic ----
     ss_source = (
         df.loc[df["_inv_acct_norm"].ne("") & df["_inv_acct_norm"].notna()]
-        .groupby("_inv_acct_norm")["Commitment Amount"]
+        .groupby("_inv_acct_norm", as_index=True)["Commitment Amount"]
         .sum()
         .to_dict()
     )
@@ -89,22 +83,23 @@ def create_commitment_sheet():
     investern = pd.read_excel(wizard_file, sheet_name="investern_format", engine="openpyxl")
     investern.columns = investern.columns.str.strip()
     investern["Investor ID"] = investern["Investor ID"].astype(str).str.strip().str.upper()
-    investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
     investern["_id_norm"] = investern["Investor ID"].apply(norm_key)
+    investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source)
     investern["SS Commitment"] = pd.to_numeric(investern["SS Commitment"], errors="coerce").fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 5. Combine left + spacer + right ----
+    # ---- 5. Combine DataFrames (df + spacer + investern) ----
     max_rows = max(len(df), len(investern))
-    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)})
-    left = df.reindex(range(max_rows)).reset_index(drop=True)
-    right = investern.reindex(range(max_rows)).reset_index(drop=True)
-    combined_df = pd.concat([left, spacer, right], axis=1)
+    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
+    df = df.reindex(range(max_rows)).reset_index(drop=True).astype(object)
+    investern = investern.reindex(range(max_rows)).reset_index(drop=True).astype(object)
 
-    # ---- 6. Add SS subtotal row ----
-    ss_total_commit = investern["SS Commitment"].sum(skipna=True)
-    ss_total_invest = investern["Invester Commitment"].sum(skipna=True)
+    combined_df = pd.concat([df, spacer, investern], axis=1)
+
+    # ---- 6. Add SS Total Row ----
+    ss_total_commit = pd.to_numeric(investern["SS Commitment"], errors="coerce").sum(skipna=True)
+    ss_total_invest = pd.to_numeric(investern["Invester Commitment"], errors="coerce").sum(skipna=True)
     ss_total_check = ss_total_commit - ss_total_invest
 
     subtotal_row = {col: "" for col in combined_df.columns}
@@ -115,34 +110,32 @@ def create_commitment_sheet():
         "SS Commitment": ss_total_commit,
         "SS Check": ss_total_check,
     })
-    combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row])], ignore_index=True)
+    subtotal_df = pd.DataFrame([subtotal_row], dtype=object)
+    combined_df = pd.concat([combined_df, subtotal_df], ignore_index=True)
 
-    # ---- 7. Blank SS fields where Investor ID missing ----
+    # ---- 7. Clean blanks for rows with missing Investor ID ----
     combined_df["Investor ID"] = combined_df["Investor ID"].astype(str).str.strip().str.upper()
-    mask_blank_ss = combined_df["Investor ID"].isin(["", "NAN", "NONE", "NULL"]) | combined_df["Investor ID"].isna()
+    mask_blank = combined_df["Investor ID"].isin(["", "NAN", "NONE", "NULL"]) | combined_df["Investor ID"].isna()
     for col in ["SS Commitment", "SS Check", "Invester Commitment"]:
         if col in combined_df.columns:
-            combined_df.loc[mask_blank_ss, col] = 0  # keep numeric 0, not string
+            combined_df.loc[mask_blank, col] = ""
 
-    # ---- 8. Final cleanup: ensure numeric cols numeric ----
-    numeric_cols = ["GS Commitment", "Commitment Amount", "GS Check",
-                    "SS Commitment", "SS Check", "Invester Commitment"]
-    for col in numeric_cols:
-        if col in combined_df.columns:
-            combined_df[col] = pd.to_numeric(combined_df[col], errors="coerce").fillna(0)
+    # ---- 8. Global NaN and dtype cleanup before Excel export ----
+    combined_df = combined_df.replace(
+        to_replace=[pd.NA, None, np.nan, "NaN", "<NA>", "None", "NULL", "nan"],
+        value=""
+    ).astype(object)
 
-    # ---- 9. Replace NaNs with blanks for Excel (after all math done) ----
-    combined_df = combined_df.replace({0: "", pd.NA: "", None: ""})
+    # ---- 9. Write clean sheet ----
+    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
+        combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
-    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as w:
-        combined_df.to_excel(w, sheet_name="Commitment Sheet", index=False)
-
-    print("✅ Commitment Sheet created successfully (no NaN, no float+str issue).")
+    print("✅ Commitment Sheet created successfully — fully clean, no NaN.")
     return combined_df
 
 
 # ---------------------------------------------------------
-# Step 2: Entry Sheet
+# Step 2: Create Entry Sheet
 # ---------------------------------------------------------
 def create_entry_sheet_with_subtotals(commitment_df):
     delete_sheet_if_exists(output_file, "Entry")
@@ -168,6 +161,7 @@ def create_entry_sheet_with_subtotals(commitment_df):
         subtotal_row[block.columns[0]] = "Subtotal"
         if "Final LE Amount" in block.columns:
             subtotal_row["Final LE Amount"] = subtotal_val
+
         block = pd.concat([block, pd.DataFrame([subtotal_row])], ignore_index=True)
         tables.append(block)
 
@@ -181,21 +175,25 @@ def create_entry_sheet_with_subtotals(commitment_df):
 
     id_to_bin = (
         cm.dropna(subset=["Bin ID"])
-          .drop_duplicates(subset=["_inv_acct_norm"])
-          .set_index("_inv_acct_norm")["Bin ID"]
-          .to_dict()
+        .drop_duplicates(subset=["_inv_acct_norm"])
+        .set_index("_inv_acct_norm")["Bin ID"]
+        .to_dict()
     )
     id_to_amt = cm.groupby("_inv_acct_norm")["Commitment Amount"].sum().to_dict()
 
     final_df["Bin ID"] = final_df["_id_norm"].map(id_to_bin)
     final_df["Commitment Amount"] = final_df["_id_norm"].map(id_to_amt)
 
-    final_df = final_df.fillna("")
+    # ---- NaN cleanup ----
+    final_df = final_df.replace(
+        to_replace=[pd.NA, None, np.nan, "NaN", "<NA>", "None", "NULL", "nan"],
+        value=""
+    ).astype(object)
 
-    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as w:
-        final_df.to_excel(w, sheet_name="Entry", index=False)
+    with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
+        final_df.to_excel(writer, sheet_name="Entry", index=False)
 
-    print("✅ Entry Sheet created successfully (clean, numeric safe).")
+    print("✅ Entry Sheet created successfully — clean, no NaN.")
 
 
 # ---------------------------------------------------------
@@ -204,4 +202,4 @@ def create_entry_sheet_with_subtotals(commitment_df):
 if __name__ == "__main__":
     commitment_df = create_commitment_sheet()
     create_entry_sheet_with_subtotals(commitment_df)
-    print("🎯 Automation completed successfully!")
+    print("🎯 Automation completed successfully — all sheets clean and correct!")
