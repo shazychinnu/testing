@@ -1,6 +1,6 @@
 import pandas as pd
 
-def create_entry_sheet_with_subtotals(commitment_df, wizard_file, cdr_file_data, output_file):
+def create_entry_sheet_with_subtotals(commitment_df):
     """
     Create an 'Entry' sheet in the output Excel file, combining data from wizard and commitment files,
     calculating subtotals per block, and joining commitment and BIN mapping data.
@@ -8,9 +8,12 @@ def create_entry_sheet_with_subtotals(commitment_df, wizard_file, cdr_file_data,
     
     # --- Helper function to normalize keys ---
     def norm_key(x):
-        if pd.isna(x):
-            return ""
-        return str(x).strip().upper()
+        s = str(x).strip()
+        if s.endswith(".0):
+            s = s[:-2]
+        s = s.replace("\u00A0", " ")
+        s = re.sub(r"[,\-]", "", s)
+        return s.upper()
 
     # --- Delete existing sheet if it exists ---
     delete_sheet_if_exists(output_file, "Entry")
