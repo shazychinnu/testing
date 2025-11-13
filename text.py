@@ -66,13 +66,17 @@ def create_entry_sheet_with_subtotals(commitment_df):
         cdr.groupby("_bin_id_form")["Investor Commitment"].sum().to_dict()
     )
 
-    # ---- Add Bin ID and Commitment Amount ----
+    # ---- Add Bin ID ----
     df_raw["Bin ID"] = df_raw["_id_norm"].map(id_to_bin)
+
+    # ---- Commitment Amount (Only if Bin ID exists) ----
     df_raw["Commitment Amount"] = df_raw["Bin ID"].apply(
         lambda x: id_to_amt.get(norm_key(x), "")
+        if pd.notna(x) and str(x).strip() != ""
+        else ""
     )
 
-    # ---- Clean headers ----
+    # ---- Clean CDR Summary headers ----
     cdr_summary.columns = clean_headers(cdr_summary.columns)
 
     # ---- Build section columns ----
@@ -102,7 +106,7 @@ def create_entry_sheet_with_subtotals(commitment_df):
 
     cdr_summary.columns = new_columns
 
-    # ---- Normalize for section mapping ----
+    # ---- Normalize CDR Summary for mapping ----
     cdr_bin_col = find_col(cdr_summary, "Account Number")
     cdr_summary[cdr_bin_col] = cdr_summary[cdr_bin_col].astype(str).apply(norm_key)
 
@@ -111,28 +115,25 @@ def create_entry_sheet_with_subtotals(commitment_df):
 
     cdr_summary_indexed = cdr_summary.set_index(cdr_bin_col)
 
-    # ---- Process blocks ----
+    # ---- Process allocation blocks ----
     for i, h in enumerate(header_rows):
         start = h
         end = header_rows[i + 1] if i + 1 < len(header_rows) else len(df_raw)
         block = df_raw.loc[start:end].reset_index(drop=True)
 
-        # Remove block header row
         block = block.drop(0).reset_index(drop=True)
-
-        block.columns = df_raw.columns  # keep global headers
+        block.columns = df_raw.columns
 
         entry_bin_col = find_col(block, "Bin ID")
 
-        # ---------- UPDATED FINAL VERSION ----------
-        # Now ALL mappings use normalized Bin IDs
+        # ---------- FINAL MAPPING (WITH BIN-ID CHECK) ----------
         for col in section_cols:
             if entry_bin_col and col in cdr_summary_indexed.columns:
-                block[col] = (
-                    block[entry_bin_col]
-                    .apply(norm_key)                     # normalize leading zeros
-                    .map(cdr_summary_indexed[col])        # map to correct column
-                    .fillna("")                           # avoid NaN
+                block[col] = block[entry_bin_col].apply(
+                    lambda x:
+                        cdr_summary_indexed[col].get(norm_key(x), "")
+                        if pd.notna(x) and str(x).strip() != ""
+                        else ""
                 )
             else:
                 block[col] = ""
@@ -157,6 +158,10 @@ def create_entry_sheet_with_subtotals(commitment_df):
     final_df = pd.concat(tables, ignore_index=True)
     final_df = clean_dataframe(final_df)
 
-    # ---- Write to Excel ----
+    # ---- Drop columns with zero actual data ----
+    final_df = final_df.dropna(axis=1, how="all")            # remove NaN columns
+    final_df = final_df.loc[:, (final_df != "").any(axis=0)]  # remove all-empty-string columns
+
+    # ---- Write ----
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         final_df.to_excel(writer, sheet_name="Entry", index=False)
