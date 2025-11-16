@@ -1,14 +1,11 @@
 def clean_legal_entity(name):
-    """Normalize Legal Entity names so FEEDER and Subtotal rows match correctly."""
+    """Normalize Subtotal Legal Entity names ONLY (do NOT remove HOLDING here)."""
     if not isinstance(name, str):
         return ""
     s = name.upper().strip()
 
-    # Remove SUBTOTAL prefix
+    # Remove SUBTOTAL: prefix only
     s = s.replace("SUBTOTAL:", "")
-
-    # Remove the word HOLDING (main cause of mismatch)
-    s = s.replace("HOLDING", "")
 
     # Normalize multiple spaces
     s = " ".join(s.split())
@@ -67,7 +64,7 @@ def create_commitment_sheet():
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
-    # ---- 4. Split into sections using subtotal rows ----
+    # ---- 4. Split sections based on Subtotal rows ----
     subtotal_mask = df["Legal Entity"].str.upper().str.contains("SUBTOTAL", na=False)
     subtotal_indices = list(df.index[subtotal_mask])
 
@@ -97,7 +94,7 @@ def create_commitment_sheet():
         subtotal_pos = len(section) - 1
         data_rows = section.iloc[:subtotal_pos]
 
-        # Normalized section Legal Entity
+        # Normalized Subtotal Section Legal Entity
         subtotal_legal_norm = clean_legal_entity(section.iloc[-1]["Legal Entity"])
 
         # Correct GS subtotal for this Legal Entity
@@ -107,10 +104,16 @@ def create_commitment_sheet():
         feeder_mask = data_rows["Bin ID"].str.upper().str.contains("FEEDER", na=False)
         feeder_positions = data_rows.index[feeder_mask].tolist()
 
-        # ---- Apply FEEDER GS = correct section GS ----
+        # ---- FEEDER-only HOLDING removal ----
         for pos in feeder_positions:
-            section.at[pos, "GS Commitment"] = correct_section_gs
-            section.at[pos, "GS Check"] = section.at[pos, "Commitment Amount"] - correct_section_gs
+            feeder_legal = section.at[pos, "Legal Entity"].upper()
+            feeder_legal = feeder_legal.replace("HOLDING", "")  # ONLY remove HOLDING here
+            feeder_legal = " ".join(feeder_legal.split())      # normalize spaces
+
+            # If FEEDER legal matches this section → apply GS subtotal
+            if feeder_legal == subtotal_legal_norm:
+                section.at[pos, "GS Commitment"] = correct_section_gs
+                section.at[pos, "GS Check"] = section.at[pos, "Commitment Amount"] - correct_section_gs
 
         # ---- Recalculate FINAL subtotal ----
         updated_data = section.iloc[:subtotal_pos]
@@ -145,7 +148,7 @@ def create_commitment_sheet():
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source).fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 8. Combine DF and Investern ----
+    # ---- 8. Final combine ----
     max_rows = max(len(df), len(investern))
     spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
 
@@ -154,7 +157,7 @@ def create_commitment_sheet():
 
     combined_df = pd.concat([df.astype(object), spacer, investern.astype(object)], axis=1)
 
-    # ---- 9. SS Subtotal ----
+    # ---- 9. SS Total ----
     subtotal_row = {col: "" for col in combined_df.columns}
     subtotal_row.update({
         "Vehicle/Investor": "Subtotal (SS Total)",
