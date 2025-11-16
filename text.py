@@ -1,3 +1,21 @@
+def clean_legal_entity(name):
+    """Normalize Legal Entity names so FEEDER and Subtotal rows match correctly."""
+    if not isinstance(name, str):
+        return ""
+    s = name.upper().strip()
+
+    # Remove SUBTOTAL prefix
+    s = s.replace("SUBTOTAL:", "")
+
+    # Remove the word HOLDING (main cause of mismatch)
+    s = s.replace("HOLDING", "")
+
+    # Normalize multiple spaces
+    s = " ".join(s.split())
+
+    return s.strip()
+
+
 def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
@@ -12,7 +30,7 @@ def create_commitment_sheet():
     cdr["_investor_norm"] = cdr["Investor ID"].apply(norm_key)
     cdr["Investor Commitment"] = pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
 
-    # Build GS lookup tables
+    # GS source: Multi-key & fallback
     multi_key_commit = {
         (row["_bin_norm"], row["_investor_norm"]): row["Investor Commitment"]
         for _, row in cdr.iterrows()
@@ -33,14 +51,13 @@ def create_commitment_sheet():
 
     df["Legal Entity"] = df["Legal Entity"].astype(str).fillna("").str.strip()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
-
     df["Bin ID"] = df["Bin ID"].astype(str).fillna("").str.strip()
     df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).fillna("").str.strip()
 
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
     df["_inv_acct_norm"] = df["Investran Acct ID"].apply(norm_key)
 
-    # ---- 3. GS COMMITMENT LOOKUP ----
+    # ---- 3. GS COMMITMENT from CDR ----
     def lookup_gs(row):
         key = (row["_bin_norm"], row["_inv_acct_norm"])
         if key in multi_key_commit:
@@ -50,7 +67,7 @@ def create_commitment_sheet():
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
-    # ---- 4. Split sections based on Subtotal rows ----
+    # ---- 4. Split into sections using subtotal rows ----
     subtotal_mask = df["Legal Entity"].str.upper().str.contains("SUBTOTAL", na=False)
     subtotal_indices = list(df.index[subtotal_mask])
 
@@ -61,51 +78,46 @@ def create_commitment_sheet():
         sections.append(section)
         start = idx + 1
 
-    # ---- 5. BUILD section_totals BY LEGAL ENTITY ----
+    # ---- 5. Build section_totals using normalized names ----
     section_totals = {}
     for section in sections:
         sec = section.reset_index(drop=True)
-        if len(sec) == 0:
-            continue
-
         subtotal_row = sec.iloc[-1]
-        legal = subtotal_row["Legal Entity"].replace("Subtotal:", "").strip().upper()
 
+        legal_norm = clean_legal_entity(subtotal_row["Legal Entity"])
         gs_value = float(subtotal_row["GS Commitment"])
-        section_totals[legal] = gs_value
 
-    # ---- 6. PROCESS SECTIONS WITH CORRECT FEEDER LOGIC ----
+        section_totals[legal_norm] = gs_value
+
+    # ---- 6. Process sections with FEEDER fix ----
     processed_sections = []
 
     for section in sections:
         section = section.reset_index(drop=True)
-        if len(section) == 0:
-            continue
-
         subtotal_pos = len(section) - 1
         data_rows = section.iloc[:subtotal_pos]
 
-        # Extract Legal Entity for this section
-        subtotal_legal = section.iloc[-1]["Legal Entity"].replace("Subtotal:", "").strip().upper()
+        # Normalized section Legal Entity
+        subtotal_legal_norm = clean_legal_entity(section.iloc[-1]["Legal Entity"])
 
-        # FEEDER FIX — get correct GS subtotal for this Legal Entity
-        correct_section_gs = section_totals.get(subtotal_legal, 0)
+        # Correct GS subtotal for this Legal Entity
+        correct_section_gs = section_totals.get(subtotal_legal_norm, 0)
 
-        # Identify FEEDER rows
+        # FEEDER identification
         feeder_mask = data_rows["Bin ID"].str.upper().str.contains("FEEDER", na=False)
-        feeder_indices = data_rows.index[feeder_mask].tolist()
+        feeder_positions = data_rows.index[feeder_mask].tolist()
 
-        # Update FEEDER rows
-        for pos in feeder_indices:
+        # ---- Apply FEEDER GS = correct section GS ----
+        for pos in feeder_positions:
             section.at[pos, "GS Commitment"] = correct_section_gs
             section.at[pos, "GS Check"] = section.at[pos, "Commitment Amount"] - correct_section_gs
 
-        # ---- Recompute FINAL subtotal after feeder updates ----
+        # ---- Recalculate FINAL subtotal ----
         updated_data = section.iloc[:subtotal_pos]
         final_commit_sum = pd.to_numeric(updated_data["Commitment Amount"], errors="coerce").fillna(0).sum()
         final_gs_sum = pd.to_numeric(updated_data["GS Commitment"], errors="coerce").fillna(0).sum()
 
-        # Write final subtotal to subtotal row
+        # Write final subtotal back to the subtotal row
         section.at[subtotal_pos, "Commitment Amount"] = final_commit_sum
         section.at[subtotal_pos, "GS Commitment"] = final_gs_sum
         section.at[subtotal_pos, "GS Check"] = final_commit_sum - final_gs_sum
@@ -133,16 +145,16 @@ def create_commitment_sheet():
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source).fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 8. Final combine ----
+    # ---- 8. Combine DF and Investern ----
     max_rows = max(len(df), len(investern))
-    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)})
+    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
 
     df = df.reindex(range(max_rows)).reset_index(drop=True)
     investern = investern.reindex(range(max_rows)).reset_index(drop=True)
 
     combined_df = pd.concat([df.astype(object), spacer, investern.astype(object)], axis=1)
 
-    # ---- 9. SS Total ----
+    # ---- 9. SS Subtotal ----
     subtotal_row = {col: "" for col in combined_df.columns}
     subtotal_row.update({
         "Vehicle/Investor": "Subtotal (SS Total)",
@@ -153,7 +165,7 @@ def create_commitment_sheet():
 
     combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row])], ignore_index=True)
 
-    # ---- 10. Cleanup & write ----
+    # ---- 10. Cleanup and Write ----
     internal_cols = [c for c in combined_df.columns if c.startswith("_")]
     combined_df.drop(columns=internal_cols, inplace=True, errors="ignore")
     combined_df = clean_dataframe(combined_df)
