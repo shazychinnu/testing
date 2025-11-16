@@ -10,7 +10,6 @@ def create_commitment_sheet():
         skiprows=2,
         dtype={"Account Number": str, "Investor ID": str}
     )
-
     cdr.columns = cdr.columns.str.strip()
 
     # Normalize CDR keys
@@ -28,7 +27,7 @@ def create_commitment_sheet():
     ).fillna(0)
 
     # ---------------------------------------------------------
-    # MATCH KEYS
+    # GS MATCH KEYS
     # ---------------------------------------------------------
 
     # Exact match: (Bin ID + Investor ID)
@@ -56,10 +55,7 @@ def create_commitment_sheet():
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
 
     # Normalize keys
-    df["Bin ID"] = (
-        df["Bin ID"].astype(str).str.strip()
-        .str.replace(r"[^A-Za-z0-9]", "", regex=True)
-    )
+    df["Bin ID"] = df["Bin ID"].astype(str).str.strip().str.replace(r"[^A-Za-z0-9]", "", regex=True)
     df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip()
 
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
@@ -72,7 +68,6 @@ def create_commitment_sheet():
         key1 = (row["_bin_norm"], row["_inv_acct_norm"])
         if key1 in multi_key_commit:
             return multi_key_commit[key1]
-
         return bin_only_commit.get(row["_bin_norm"], 0)
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
@@ -87,7 +82,6 @@ def create_commitment_sheet():
     start_idx = 0
     for idx in subtotal_indices:
         section = df.iloc[start_idx:idx]
-
         total_commit = section["Commitment Amount"].sum()
         total_gs = section["GS Commitment"].sum()
 
@@ -100,29 +94,55 @@ def create_commitment_sheet():
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # FINAL FEEDER LOGIC (Legal Entity-Based)
+    # FEEDER LOGIC — MATCH "Subtotal:<Legal Entity>"
     # ---------------------------------------------------------
     for idx, row in df.iterrows():
 
         bin_id = str(row["Bin ID"]).upper()
+
         if not bin_id.startswith("FEEDER"):
             continue
 
-        legal = row["Legal Entity"].upper().strip()
+        legal = row["Legal Entity"].strip()
+        legal_upper = legal.upper()
 
-        # Find subtotal row for same Legal Entity
-        subtotal_row = df[
-            df["Legal Entity"].str.upper().str.contains("SUBTOTAL")
-            &
-            df["Legal Entity"].str.upper().str.contains(legal)
+        # All possible subtotal patterns
+        patterns = [
+            f"SUBTOTAL:{legal_upper}",
+            f"SUBTOTAL: {legal_upper}",
+            f"SUBTOTAL - {legal_upper}",
+            f"SUBTOTAL {legal_upper}",
         ]
 
-        if not subtotal_row.empty:
-            subtotal_gs = float(subtotal_row["GS Commitment"].values[0])
+        # Try direct match
+        subtotal_row = df[
+            df["Legal Entity"].str.upper().isin(patterns)
+        ]
 
-            # Update ONLY GS Commitment
-            df.at[idx, "GS Commitment"] = subtotal_gs
+        # If still empty → fallback: any subtotal containing Legal Entity name
+        if subtotal_row.empty:
+            subtotal_row = df[
+                df["Legal Entity"].str.upper().str.contains("SUBTOTAL")
+                &
+                df["Legal Entity"].str.upper().str.contains(legal_upper)
+            ]
 
+        # If still empty → fallback: nearest subtotal above
+        if subtotal_row.empty:
+            above = df.loc[:idx]
+            subtotal_row = above[
+                above["Legal Entity"].str.upper().str.contains("SUBTOTAL")
+            ].tail(1)
+
+        if subtotal_row.empty:
+            continue
+
+        subtotal_gs = float(subtotal_row["GS Commitment"].values[0])
+
+        # Update GS ONLY (not Commitment Amount)
+        df.at[idx, "GS Commitment"] = subtotal_gs
+
+    # Recompute GS Check
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---- 4. SS Commitment ----
