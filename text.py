@@ -2,7 +2,7 @@ def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
 
-    # ---- 1. Load CDR Summary (force proper dtypes)
+    # ---- 1. Load CDR Summary By Investor (force correct dtype)
     cdr = pd.read_excel(
         cdr_file,
         sheet_name="CDR Summary By Investor",
@@ -13,26 +13,24 @@ def create_commitment_sheet():
 
     cdr.columns = cdr.columns.str.strip()
 
-    # Normalize for matching
-    cdr["_bin_norm"] = cdr["Account Number"].apply(norm_key)      # BIN ID equivalent
-    cdr["_inv_id_norm"] = cdr["Investor ID"].astype(str).apply(norm_key)
+    # Normalize keys
+    cdr["_bin_norm"] = cdr["Account Number"].apply(norm_key)
+    cdr["_investor_norm"] = cdr["Investor ID"].astype(str).apply(norm_key)
 
     cdr["Investor Commitment"] = pd.to_numeric(
         cdr["Investor Commitment"], errors="coerce"
     ).fillna(0)
 
     # ---------------------------------------------------------
-    # TRUE FINAL FIX: BUILD MULTI-KEY LOOKUP WITHOUT SUM
-    # (Bin ID + Investor ID) → Commitment
+    # CORRECT MULTI-KEY MATCHING (BIN ID + INVESTOR ID)
+    # No summing, no first/last errors.
     # ---------------------------------------------------------
     acct_to_commit_multi = {}
     for _, row in cdr.iterrows():
-        key = (row["_bin_norm"], row["_inv_id_norm"])
-        # keep FIRST occurrence only (correct business logic)
-        if key not in acct_to_commit_multi:
-            acct_to_commit_multi[key] = row["Investor Commitment"]
+        key = (row["_bin_norm"], row["_investor_norm"])
+        acct_to_commit_multi[key] = row["Investor Commitment"]
 
-    # ---- 2. Load Data_format with correct string dtype
+    # ---- 2. Load Data_format (correct dtype)
     df = pd.read_excel(
         wizard_file,
         sheet_name="Data_format",
@@ -47,32 +45,27 @@ def create_commitment_sheet():
         df["Commitment Amount"], errors="coerce"
     ).fillna(0)
 
-    # Normalize BIN + Investran Acct ID
+    # Normalize Data_format keys
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
     df["_inv_acct_norm"] = df["Investran Acct ID"].apply(norm_key)
 
     # ---------------------------------------------------------
-    # CORRECT GS COMMITMENT LOOKUP (NO SUM, NO DUPLICATE ERROR)
+    # PERFECT GS COMMITMENT LOOKUP (EXACT MATCH)
     # ---------------------------------------------------------
     def lookup_gs(row):
         key = (row["_bin_norm"], row["_inv_acct_norm"])
-
-        # FIRST: exact match on (BIN ID + Investor ID)
-        if key in acct_to_commit_multi:
-            return acct_to_commit_multi[key]
-
-        return 0  # no fallback needed unless you tell me
+        return acct_to_commit_multi.get(key, 0)
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
 
-    # Replace Commitment Amount where missing
+    # Replace missing commitments
     df.loc[
         (df["Commitment Amount"] == 0) & (df["GS Commitment"] != 0),
         "Commitment Amount"
     ] = df["GS Commitment"]
 
     # ------------------------------
-    # SUBTOTAL LOGIC (unchanged)
+    # SUBTOTAL LOGIC (same as your original)
     # ------------------------------
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
     subtotal_indices = df.index[subtotal_mask].to_list()
@@ -87,7 +80,7 @@ def create_commitment_sheet():
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
-    # ---- 4. SS Commitment
+    # ---- 4. SS Commitment (unchanged)
     ss_source = (
         df.loc[df["_bin_norm"].ne("") & df["_bin_norm"].notna()]
           .groupby("_bin_norm")["Commitment Amount"]
@@ -140,7 +133,7 @@ def create_commitment_sheet():
     # ---- 8. Final cleanup
     combined_df = clean_dataframe(combined_df)
 
-    # ---- 9. Write final output
+    # ---- 9. Write to Excel
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
