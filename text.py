@@ -30,13 +30,11 @@ def create_commitment_sheet():
     # MATCH KEYS
     # ---------------------------------------------------------
 
-    # Exact match: (Bin ID + Investor ID)
     multi_key_commit = {
         (row["_bin_norm"], row["_investor_norm"]): row["Investor Commitment"]
         for _, row in cdr.iterrows()
     }
 
-    # Fallback: Bin ID only
     bin_only_commit = {}
     for _, row in cdr.iterrows():
         if row["_bin_norm"] not in bin_only_commit:
@@ -54,11 +52,7 @@ def create_commitment_sheet():
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
 
-    # Normalize keys
-    df["Bin ID"] = (
-        df["Bin ID"].astype(str).str.strip()
-        .str.replace(r"[^A-Za-z0-9]", "", regex=True)
-    )
+    df["Bin ID"] = df["Bin ID"].astype(str).str.strip()
     df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip()
 
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
@@ -71,7 +65,6 @@ def create_commitment_sheet():
         key1 = (row["_bin_norm"], row["_inv_acct_norm"])
         if key1 in multi_key_commit:
             return multi_key_commit[key1]
-
         return bin_only_commit.get(row["_bin_norm"], 0)
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
@@ -99,25 +92,34 @@ def create_commitment_sheet():
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # FINAL FEEDER LOGIC (SCAN DOWNWARD TO FIND SUBTOTAL)
+    # FINAL FEEDER LOGIC
+    # Detect FEEDER rows using: "FEEDER" in Bin ID
+    # Find subtotal using structural scan downward
     # ---------------------------------------------------------
     for idx, row in df.iterrows():
 
         bin_id = str(row["Bin ID"]).upper()
 
-        # Only for FEEDER rows
-        if not bin_id.startswith("FEEDER"):
+        # Correct FEEDER detection
+        if "FEEDER" not in bin_id:
             continue
 
-        # Scan downward to find next subtotal
+        # Scan downward to find next subtotal row
         for j in range(idx + 1, len(df)):
-            if "SUBTOTAL" in str(df.at[j, "Legal Entity"]).upper():
+            # subtotal row pattern:
+            if (
+                str(df.at[j, "Legal Entity"]).strip() == "" and
+                str(df.at[j, "Bin ID"]).strip() == "" and
+                pd.to_numeric(df.at[j, "GS Commitment"], errors="coerce") > 0
+            ):
                 subtotal_gs = df.at[j, "GS Commitment"]
 
-                # Update ONLY GS Commitment
+                # Update ONLY GS Commitment for FEEDER
                 df.at[idx, "GS Commitment"] = subtotal_gs
                 df.at[idx, "GS Check"] = df.at[idx, "Commitment Amount"] - subtotal_gs
                 break
+
+    df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---- 4. SS Commitment ----
     ss_source = (
