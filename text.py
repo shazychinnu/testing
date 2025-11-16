@@ -27,7 +27,7 @@ def create_commitment_sheet():
     )
 
     # ---------------------------------------------------------
-    # PRIMARY MATCH (Bin ID + Investor ID)
+    # PRIMARY MATCH: (Bin ID + Investor ID)
     # ---------------------------------------------------------
     multi_key_commit = {}
     for _, row in cdr.iterrows():
@@ -35,7 +35,7 @@ def create_commitment_sheet():
         multi_key_commit[key] = row["Investor Commitment"]
 
     # ---------------------------------------------------------
-    # FALLBACK: Bin ID only
+    # FALLBACK MATCH: Bin ID only
     # ---------------------------------------------------------
     bin_only_commit = {}
     for _, row in cdr.iterrows():
@@ -65,28 +65,28 @@ def create_commitment_sheet():
     df["_inv_acct_norm"] = df["Investran Acct ID"].apply(norm_key)
 
     # ---------------------------------------------------------
-    # FINAL GS COMMITMENT LOOKUP (Option B)
+    # GS COMMITMENT LOOKUP
     # ---------------------------------------------------------
     def lookup_gs(row):
         key1 = (row["_bin_norm"], row["_inv_acct_norm"])
         if key1 in multi_key_commit:
             return multi_key_commit[key1]
 
-        key2 = row["_bin_norm"]  # fallback: bin-only
+        key2 = row["_bin_norm"]
         return bin_only_commit.get(key2, 0)
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
 
-    # Fill Commitment Amount = GS Commitment when needed
+    # Commitment Amount replacement
     df.loc[
         (df["Commitment Amount"] == 0) & (df["GS Commitment"] != 0),
         "Commitment Amount"
     ] = df["GS Commitment"]
 
     # ------------------------------
-    # SUBTOTAL CALCULATION (unchanged)
+    # SUBTOTAL CALCULATION
     # ------------------------------
-    subtotal_mask = df["Legal Entity"].str.upper().str.startswith("SUBTOTAL")
+    subtotal_mask = df["Legal Entity"].str.upper().str.contains("SUBTOTAL")
     subtotal_indices = df.index[subtotal_mask].to_list()
 
     start_idx = 0
@@ -94,41 +94,47 @@ def create_commitment_sheet():
         section = df.iloc[start_idx:idx]
         df.at[idx, "Commitment Amount"] = section["Commitment Amount"].sum()
         df.at[idx, "GS Commitment"] = section["GS Commitment"].sum()
-        df.at[idx, "GS Check"] = (
-            df.at[idx, "Commitment Amount"] - df.at[idx, "GS Commitment"]
-        )
+        df.at[idx, "GS Check"] = df.at[idx, "Commitment Amount"] - df.at[idx, "GS Commitment"]
         start_idx = idx + 1
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # NEW: CORRECT FEEDER LOGIC (MATCHES REAL EXCEL)
+    # NEW: SECTION-BASED FEEDER LOGIC (CORRECT)
     # ---------------------------------------------------------
+
     feeder_mask = df["Bin ID"].str.upper().str.startswith("FEEDER")
 
-    for idx, row in df.loc[feeder_mask].iterrows():
+    # Boundaries of sections = subtotal rows + end of sheet
+    boundaries = subtotal_indices + [len(df)]
 
-        feeder_le = str(row["Legal Entity"]).strip()
+    start = 0
+    for end in boundaries:
 
-        # Find subtotal row pattern:
-        # "Subtotal: <Legal Entity>"
-        subtotal_row = df.loc[
-            df["Legal Entity"].astype(str).str.upper().str.startswith("SUBTOTAL:")
-            &
-            df["Legal Entity"].astype(str).str.upper().str.contains(feeder_le.upper())
+        # Section between 2 subtotals
+        section_rows = list(range(start, end))
+
+        # Identify FEEDER rows inside this section
+        feeder_rows = [
+            r for r in section_rows
+            if df.at[r, "Bin ID"].upper().startswith("FEEDER")
         ]
 
-        if subtotal_row.empty:
-            continue
+        if feeder_rows:
 
-        subtotal_gs = subtotal_row["GS Commitment"].values[0]
+            # The subtotal row is always at index = end
+            if end < len(df):
+                subtotal_gs = df.at[end, "GS Commitment"]
 
-        # Update FEEDER GS Commitment
-        df.at[idx, "GS Commitment"] = subtotal_gs
+                # Apply subtotal GS to all FEEDER rows in this section
+                for r in feeder_rows:
+                    df.at[r, "GS Commitment"] = subtotal_gs
 
-        # Update Commitment Amount ONLY if 0 or blank
-        if df.at[idx, "Commitment Amount"] == 0:
-            df.at[idx, "Commitment Amount"] = subtotal_gs
+                    # Update Commitment Amount if zero
+                    if df.at[r, "Commitment Amount"] == 0:
+                        df.at[r, "Commitment Amount"] = subtotal_gs
+
+        start = end + 1
 
     # ---- 4. SS Commitment (unchanged) ----
     ss_source = (
@@ -171,8 +177,7 @@ def create_commitment_sheet():
         "Vehicle/Investor": "Subtotal (SS Total)",
         "Invester Commitment": investern["Invester Commitment"].sum(),
         "SS Commitment": investern["SS Commitment"].sum(),
-        "SS Check": investern["SS Commitment"].sum()
-                        - investern["Invester Commitment"].sum()
+        "SS Check": investern["SS Commitment"].sum() - investern["Invester Commitment"].sum()
     })
 
     combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row], dtype=object)], ignore_index=True)
