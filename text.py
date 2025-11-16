@@ -23,21 +23,21 @@ def create_commitment_sheet():
     cdr["_bin_norm"] = cdr["Account Number"].apply(norm_key)
     cdr["_investor_norm"] = cdr["Investor ID"].apply(norm_key)
 
-    cdr["Investor Commitment"] = (
-        pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
-    )
+    cdr["Investor Commitment"] = pd.to_numeric(
+        cdr["Investor Commitment"], errors="coerce"
+    ).fillna(0)
 
     # ---------------------------------------------------------
     # MATCH KEYS
     # ---------------------------------------------------------
 
-    # 1️⃣ Exact match: (Bin ID + Investor ID)
-    multi_key_commit = {}
-    for _, row in cdr.iterrows():
-        key = (row["_bin_norm"], row["_investor_norm"])
-        multi_key_commit[key] = row["Investor Commitment"]
+    # Exact match: (Bin ID + Investor ID)
+    multi_key_commit = {
+        (row["_bin_norm"], row["_investor_norm"]): row["Investor Commitment"]
+        for _, row in cdr.iterrows()
+    }
 
-    # 2️⃣ Fallback match: Bin ID only
+    # Fallback: Bin ID only
     bin_only_commit = {}
     for _, row in cdr.iterrows():
         if row["_bin_norm"] not in bin_only_commit:
@@ -50,13 +50,12 @@ def create_commitment_sheet():
         engine="openpyxl",
         dtype={"Investran Acct ID": str, "Bin ID": str, "Legal Entity": str}
     )
-
     df.columns = df.columns.str.strip()
 
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
     df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
 
-    # Normalize Data_format keys
+    # Normalize keys
     df["Bin ID"] = (
         df["Bin ID"].astype(str).str.strip()
         .str.replace(r"[^A-Za-z0-9]", "", regex=True)
@@ -74,12 +73,9 @@ def create_commitment_sheet():
         if key1 in multi_key_commit:
             return multi_key_commit[key1]
 
-        key2 = row["_bin_norm"]
-        return bin_only_commit.get(key2, 0)
+        return bin_only_commit.get(row["_bin_norm"], 0)
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
-
-    # Do NOT update Commitment Amount for any reason
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ------------------------------
@@ -93,53 +89,46 @@ def create_commitment_sheet():
         section = df.iloc[start_idx:idx]
 
         total_commit = section["Commitment Amount"].sum()
-        total_gs_commit = section["GS Commitment"].sum()
+        total_gs = section["GS Commitment"].sum()
 
         df.at[idx, "Commitment Amount"] = total_commit
-        df.at[idx, "GS Commitment"] = total_gs_commit
-        df.at[idx, "GS Check"] = total_commit - total_gs_commit
+        df.at[idx, "GS Commitment"] = total_gs
+        df.at[idx, "GS Check"] = total_commit - total_gs
 
         start_idx = idx + 1
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # FEEDER LOGIC — ALWAYS UPDATE ONLY GS COMMITMENT
+    # FINAL FEEDER LOGIC (Legal Entity-Based)
     # ---------------------------------------------------------
+    for idx, row in df.iterrows():
 
-    feeder_mask = df["Bin ID"].str.upper().str.startswith("FEEDER")
+        bin_id = str(row["Bin ID"]).upper()
+        if not bin_id.startswith("FEEDER"):
+            continue
 
-    boundaries = subtotal_indices + [len(df)]
+        legal = row["Legal Entity"].upper().strip()
 
-    start = 0
-    for end in boundaries:
-
-        section_rows = list(range(start, end))
-
-        feeder_rows = [
-            r for r in section_rows
-            if df.at[r, "Bin ID"].upper().startswith("FEEDER")
+        # Find subtotal row for same Legal Entity
+        subtotal_row = df[
+            df["Legal Entity"].str.upper().str.contains("SUBTOTAL")
+            &
+            df["Legal Entity"].str.upper().str.contains(legal)
         ]
 
-        if feeder_rows and end < len(df):
+        if not subtotal_row.empty:
+            subtotal_gs = float(subtotal_row["GS Commitment"].values[0])
 
-            subtotal_gs = df.at[end, "GS Commitment"]
-
-            # ALWAYS update ONLY GS Commitment
-            for r in feeder_rows:
-                df.at[r, "GS Commitment"] = subtotal_gs
-                # Commitment Amount must NOT be changed
-
-        start = end + 1
+            # Update ONLY GS Commitment
+            df.at[idx, "GS Commitment"] = subtotal_gs
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---- 4. SS Commitment ----
     ss_source = (
-        df.loc[df["_bin_norm"].ne("") & df["_bin_norm"].notna()]
-          .groupby("_bin_norm")["Commitment Amount"]
-          .sum()
-          .to_dict()
+        df[df["_bin_norm"].notna() & (df["_bin_norm"] != "")]
+        .groupby("_bin_norm")["Commitment Amount"].sum().to_dict()
     )
 
     investern = pd.read_excel(
@@ -148,9 +137,9 @@ def create_commitment_sheet():
         engine="openpyxl",
         dtype={"Account Number": str}
     )
-
     investern.columns = investern.columns.str.strip()
-    investern["Account Number"] = investern["Account Number"].astype(str).str.strip().str.upper()
+
+    investern["Account Number"] = investern["Account Number"].astype(str).str.upper().str.strip()
     investern["_id_norm"] = investern["Account Number"].apply(norm_key)
 
     investern["Invester Commitment"] = pd.to_numeric(
@@ -162,7 +151,7 @@ def create_commitment_sheet():
 
     # ---- 5. Combine ----
     max_rows = max(len(df), len(investern))
-    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
+    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)})
 
     df = df.reindex(range(max_rows)).reset_index(drop=True)
     investern = investern.reindex(range(max_rows)).reset_index(drop=True)
@@ -175,14 +164,14 @@ def create_commitment_sheet():
         "Vehicle/Investor": "Subtotal (SS Total)",
         "Invester Commitment": investern["Invester Commitment"].sum(),
         "SS Commitment": investern["SS Commitment"].sum(),
-        "SS Check": investern["SS Commitment"].sum() - investern["Invester Commitment"].sum()
+        "SS Check": investern["SS Commitment"].sum() - investern["Invester Commitment"].sum(),
     })
 
-    combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row], dtype=object)], ignore_index=True)
+    combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row])], ignore_index=True)
 
     # ---- 7. Cleanup ----
-    internal_cols = [c for c in combined_df.columns if c.startswith("_")]
-    combined_df.drop(columns=internal_cols, inplace=True, errors="ignore")
+    drop_cols = [c for c in combined_df.columns if c.startswith("_")]
+    combined_df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
     combined_df = clean_dataframe(combined_df)
 
