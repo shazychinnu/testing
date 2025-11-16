@@ -30,11 +30,13 @@ def create_commitment_sheet():
     # MATCH KEYS
     # ---------------------------------------------------------
 
+    # Exact match (BIN + Investor ID)
     multi_key_commit = {
         (row["_bin_norm"], row["_investor_norm"]): row["Investor Commitment"]
         for _, row in cdr.iterrows()
     }
 
+    # Fallback: BIN only
     bin_only_commit = {}
     for _, row in cdr.iterrows():
         if row["_bin_norm"] not in bin_only_commit:
@@ -73,6 +75,7 @@ def create_commitment_sheet():
     # ------------------------------
     # SUBTOTAL CALCULATION
     # ------------------------------
+
     subtotal_mask = df["Legal Entity"].str.upper().str.contains("SUBTOTAL")
     subtotal_indices = df.index[subtotal_mask].to_list()
 
@@ -92,32 +95,45 @@ def create_commitment_sheet():
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # FINAL FEEDER LOGIC
-    # Detect FEEDER rows using: "FEEDER" in Bin ID
-    # Find subtotal using structural scan downward
+    # FINAL FEEDER LOGIC (Correct FEEDER & Subtotal Matching)
     # ---------------------------------------------------------
-    for idx, row in df.iterrows():
 
+    # Pre-extract subtotal rows
+    subtotal_rows = df[df["Legal Entity"].str.upper().str.contains("SUBTOTAL")].copy()
+
+    # Normalize subtotal entity names
+    subtotal_rows["legal_norm"] = (
+        subtotal_rows["Legal Entity"]
+        .str.upper()
+        .str.replace("SUBTOTAL", "")
+        .str.replace(":", "")
+        .str.replace(" ", "")
+    )
+
+    for idx, row in df.iterrows():
         bin_id = str(row["Bin ID"]).upper()
 
-        # Correct FEEDER detection
+        # Correct FEEDER identification
         if "FEEDER" not in bin_id:
             continue
 
-        # Scan downward to find next subtotal row
-        for j in range(idx + 1, len(df)):
-            # subtotal row pattern:
-            if (
-                str(df.at[j, "Legal Entity"]).strip() == "" and
-                str(df.at[j, "Bin ID"]).strip() == "" and
-                pd.to_numeric(df.at[j, "GS Commitment"], errors="coerce") > 0
-            ):
-                subtotal_gs = df.at[j, "GS Commitment"]
+        feeder_legal = (
+            row["Legal Entity"]
+            .upper()
+            .replace(" ", "")
+        )
 
-                # Update ONLY GS Commitment for FEEDER
-                df.at[idx, "GS Commitment"] = subtotal_gs
-                df.at[idx, "GS Check"] = df.at[idx, "Commitment Amount"] - subtotal_gs
-                break
+        # Match FEEDER legal entity to subtotal legal entity
+        match = subtotal_rows[
+            subtotal_rows["legal_norm"] == feeder_legal
+        ]
+
+        if not match.empty:
+            subtotal_gs = float(match["GS Commitment"].values[0])
+
+            # Update only GS Commitment
+            df.at[idx, "GS Commitment"] = subtotal_gs
+            df.at[idx, "GS Check"] = row["Commitment Amount"] - subtotal_gs
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
