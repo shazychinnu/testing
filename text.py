@@ -15,7 +15,8 @@ def create_commitment_sheet():
 
     # Normalize CDR keys
     cdr["Account Number"] = (
-        cdr["Account Number"].astype(str).str.strip().str.replace(r"[^A-Za-z0-9]", "", regex=True)
+        cdr["Account Number"].astype(str).str.strip()
+        .str.replace(r"[^A-Za-z0-9]", "", regex=True)
     )
     cdr["Investor ID"] = cdr["Investor ID"].astype(str).str.strip()
 
@@ -27,16 +28,16 @@ def create_commitment_sheet():
     )
 
     # ---------------------------------------------------------
-    # PRIMARY MATCH: (Bin ID + Investor ID)
+    # MATCH KEYS
     # ---------------------------------------------------------
+
+    # 1️⃣ Exact match: (Bin ID + Investor ID)
     multi_key_commit = {}
     for _, row in cdr.iterrows():
         key = (row["_bin_norm"], row["_investor_norm"])
         multi_key_commit[key] = row["Investor Commitment"]
 
-    # ---------------------------------------------------------
-    # FALLBACK MATCH: Bin ID only
-    # ---------------------------------------------------------
+    # 2️⃣ Fallback match: Bin ID only
     bin_only_commit = {}
     for _, row in cdr.iterrows():
         if row["_bin_norm"] not in bin_only_commit:
@@ -57,7 +58,8 @@ def create_commitment_sheet():
 
     # Normalize Data_format keys
     df["Bin ID"] = (
-        df["Bin ID"].astype(str).str.strip().str.replace(r"[^A-Za-z0-9]", "", regex=True)
+        df["Bin ID"].astype(str).str.strip()
+        .str.replace(r"[^A-Za-z0-9]", "", regex=True)
     )
     df["Investran Acct ID"] = df["Investran Acct ID"].astype(str).str.strip()
 
@@ -77,11 +79,8 @@ def create_commitment_sheet():
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
 
-    # Commitment Amount replacement
-    df.loc[
-        (df["Commitment Amount"] == 0) & (df["GS Commitment"] != 0),
-        "Commitment Amount"
-    ] = df["GS Commitment"]
+    # Do NOT update Commitment Amount for any reason
+    df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ------------------------------
     # SUBTOTAL CALCULATION
@@ -92,51 +91,50 @@ def create_commitment_sheet():
     start_idx = 0
     for idx in subtotal_indices:
         section = df.iloc[start_idx:idx]
-        df.at[idx, "Commitment Amount"] = section["Commitment Amount"].sum()
-        df.at[idx, "GS Commitment"] = section["GS Commitment"].sum()
-        df.at[idx, "GS Check"] = df.at[idx, "Commitment Amount"] - df.at[idx, "GS Commitment"]
+
+        total_commit = section["Commitment Amount"].sum()
+        total_gs_commit = section["GS Commitment"].sum()
+
+        df.at[idx, "Commitment Amount"] = total_commit
+        df.at[idx, "GS Commitment"] = total_gs_commit
+        df.at[idx, "GS Check"] = total_commit - total_gs_commit
+
         start_idx = idx + 1
 
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
     # ---------------------------------------------------------
-    # NEW: SECTION-BASED FEEDER LOGIC (CORRECT)
+    # FEEDER LOGIC — ALWAYS UPDATE ONLY GS COMMITMENT
     # ---------------------------------------------------------
 
     feeder_mask = df["Bin ID"].str.upper().str.startswith("FEEDER")
 
-    # Boundaries of sections = subtotal rows + end of sheet
     boundaries = subtotal_indices + [len(df)]
 
     start = 0
     for end in boundaries:
 
-        # Section between 2 subtotals
         section_rows = list(range(start, end))
 
-        # Identify FEEDER rows inside this section
         feeder_rows = [
             r for r in section_rows
             if df.at[r, "Bin ID"].upper().startswith("FEEDER")
         ]
 
-        if feeder_rows:
+        if feeder_rows and end < len(df):
 
-            # The subtotal row is always at index = end
-            if end < len(df):
-                subtotal_gs = df.at[end, "GS Commitment"]
+            subtotal_gs = df.at[end, "GS Commitment"]
 
-                # Apply subtotal GS to all FEEDER rows in this section
-                for r in feeder_rows:
-                    df.at[r, "GS Commitment"] = subtotal_gs
-
-                    # Update Commitment Amount if zero
-                    if df.at[r, "Commitment Amount"] == 0:
-                        df.at[r, "Commitment Amount"] = subtotal_gs
+            # ALWAYS update ONLY GS Commitment
+            for r in feeder_rows:
+                df.at[r, "GS Commitment"] = subtotal_gs
+                # Commitment Amount must NOT be changed
 
         start = end + 1
 
-    # ---- 4. SS Commitment (unchanged) ----
+    df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
+
+    # ---- 4. SS Commitment ----
     ss_source = (
         df.loc[df["_bin_norm"].ne("") & df["_bin_norm"].notna()]
           .groupby("_bin_norm")["Commitment Amount"]
@@ -162,7 +160,7 @@ def create_commitment_sheet():
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source).fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 5. Combine DataFrames ----
+    # ---- 5. Combine ----
     max_rows = max(len(df), len(investern))
     spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
 
@@ -182,14 +180,13 @@ def create_commitment_sheet():
 
     combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row], dtype=object)], ignore_index=True)
 
-    # ---- 7. Remove helper columns ----
+    # ---- 7. Cleanup ----
     internal_cols = [c for c in combined_df.columns if c.startswith("_")]
     combined_df.drop(columns=internal_cols, inplace=True, errors="ignore")
 
-    # ---- 8. Cleanup ----
     combined_df = clean_dataframe(combined_df)
 
-    # ---- 9. Write to Excel ----
+    # ---- 9. Write ----
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
