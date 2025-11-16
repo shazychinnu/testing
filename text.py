@@ -2,38 +2,37 @@ def create_commitment_sheet():
     ensure_output_file_exists()
     delete_sheet_if_exists(output_file, "Commitment Sheet")
 
-    # ---- 1. Load CDR Summary By Investor (correct dtype)
+    # ---- 1. Load CDR Summary (force proper dtypes)
     cdr = pd.read_excel(
         cdr_file,
         sheet_name="CDR Summary By Investor",
         engine="openpyxl",
         skiprows=2,
-        dtype={"Account Number": str, "Investor ID": str, "Investor Name": str}
+        dtype={"Account Number": str, "Investor ID": str}
     )
 
     cdr.columns = cdr.columns.str.strip()
 
-    # Normalize account number
-    cdr["_acct_norm"] = cdr["Account Number"].apply(norm_key)
-    cdr["Investor Commitment"] = pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
+    # Normalize for matching
+    cdr["_bin_norm"] = cdr["Account Number"].apply(norm_key)      # BIN ID equivalent
+    cdr["_inv_id_norm"] = cdr["Investor ID"].astype(str).apply(norm_key)
+
+    cdr["Investor Commitment"] = pd.to_numeric(
+        cdr["Investor Commitment"], errors="coerce"
+    ).fillna(0)
 
     # ---------------------------------------------------------
-    # CORRECTED: Build dictionary WITHOUT SUM — KEEP FIRST ROW
+    # TRUE FINAL FIX: BUILD MULTI-KEY LOOKUP WITHOUT SUM
+    # (Bin ID + Investor ID) → Commitment
     # ---------------------------------------------------------
-    commit_by_acct = {}
+    acct_to_commit_multi = {}
     for _, row in cdr.iterrows():
-        acct_key = row["_acct_norm"]
-        if acct_key not in commit_by_acct:      # keep first occurrence only
-            commit_by_acct[acct_key] = row["Investor Commitment"]
+        key = (row["_bin_norm"], row["_inv_id_norm"])
+        # keep FIRST occurrence only (correct business logic)
+        if key not in acct_to_commit_multi:
+            acct_to_commit_multi[key] = row["Investor Commitment"]
 
-    # Fallback: Bin ID mapping (same structure)
-    commit_by_bin = {}
-    for _, row in cdr.iterrows():
-        bin_key = row["_acct_norm"]
-        if bin_key not in commit_by_bin:
-            commit_by_bin[bin_key] = row["Investor Commitment"]
-
-    # ---- 2. Load Data_format using correct text types
+    # ---- 2. Load Data_format with correct string dtype
     df = pd.read_excel(
         wizard_file,
         sheet_name="Data_format",
@@ -44,35 +43,37 @@ def create_commitment_sheet():
     df.columns = df.columns.str.strip()
     df["Legal Entity"] = df["Legal Entity"].astype(str).str.strip()
 
-    df["Commitment Amount"] = pd.to_numeric(df["Commitment Amount"], errors="coerce").fillna(0)
+    df["Commitment Amount"] = pd.to_numeric(
+        df["Commitment Amount"], errors="coerce"
+    ).fillna(0)
 
-    # Normalize BIN ID + Investran Acct ID
-    df["_inv_acct_norm"] = df["Investran Acct ID"].apply(norm_key)
+    # Normalize BIN + Investran Acct ID
     df["_bin_norm"] = df["Bin ID"].apply(norm_key)
+    df["_inv_acct_norm"] = df["Investran Acct ID"].apply(norm_key)
 
     # ---------------------------------------------------------
-    # CORRECTED: GS COMMITMENT LOOKUP USING FIRST MATCH ONLY
+    # CORRECT GS COMMITMENT LOOKUP (NO SUM, NO DUPLICATE ERROR)
     # ---------------------------------------------------------
     def lookup_gs(row):
-        acct = row["_inv_acct_norm"]
+        key = (row["_bin_norm"], row["_inv_acct_norm"])
 
-        # BEST MATCH → Investor Acct ID match
-        if acct in commit_by_acct:
-            return commit_by_acct[acct]
+        # FIRST: exact match on (BIN ID + Investor ID)
+        if key in acct_to_commit_multi:
+            return acct_to_commit_multi[key]
 
-        # FALLBACK → Bin ID match (rare)
-        bin_id = row["_bin_norm"]
-        return commit_by_bin.get(bin_id, 0)
+        return 0  # no fallback needed unless you tell me
 
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
 
-    # Replace Commitment Amount with GS Commitment if original is 0
+    # Replace Commitment Amount where missing
     df.loc[
         (df["Commitment Amount"] == 0) & (df["GS Commitment"] != 0),
         "Commitment Amount"
     ] = df["GS Commitment"]
 
-    # ---- Subtotals (unchanged)
+    # ------------------------------
+    # SUBTOTAL LOGIC (unchanged)
+    # ------------------------------
     subtotal_mask = df["Legal Entity"].str.contains("Subtotal", case=False, na=False)
     subtotal_indices = df.index[subtotal_mask].to_list()
 
@@ -105,7 +106,10 @@ def create_commitment_sheet():
     investern["Account Number"] = investern["Account Number"].astype(str).str.strip().str.upper()
     investern["_id_norm"] = investern["Account Number"].apply(norm_key)
 
-    investern["Invester Commitment"] = pd.to_numeric(investern["Invester Commitment"], errors="coerce").fillna(0)
+    investern["Invester Commitment"] = pd.to_numeric(
+        investern["Invester Commitment"], errors="coerce"
+    ).fillna(0)
+
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source).fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
@@ -136,7 +140,7 @@ def create_commitment_sheet():
     # ---- 8. Final cleanup
     combined_df = clean_dataframe(combined_df)
 
-    # ---- 9. Write to Excel
+    # ---- 9. Write final output
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
