@@ -12,7 +12,7 @@ def create_commitment_sheet():
     cdr["_investor_norm"] = cdr["Investor ID"].apply(norm_key)
     cdr["Investor Commitment"] = pd.to_numeric(cdr["Investor Commitment"], errors="coerce").fillna(0)
 
-    # Build keys
+    # Build GS lookup tables
     multi_key_commit = {
         (row["_bin_norm"], row["_investor_norm"]): row["Investor Commitment"]
         for _, row in cdr.iterrows()
@@ -50,17 +50,31 @@ def create_commitment_sheet():
     df["GS Commitment"] = df.apply(lookup_gs, axis=1)
     df["GS Check"] = df["Commitment Amount"] - df["GS Commitment"]
 
-    # ---- 4. Split into sections (each ends with a subtotal row) ----
-    subtotal_idx = df.index[df["Legal Entity"].str.upper().str.contains("SUBTOTAL", na=False)].tolist()
+    # ---- 4. Split sections based on Subtotal rows ----
+    subtotal_mask = df["Legal Entity"].str.upper().str.contains("SUBTOTAL", na=False)
+    subtotal_indices = list(df.index[subtotal_mask])
 
     sections = []
     start = 0
-    for idx in subtotal_idx:
+    for idx in subtotal_indices:
         section = df.iloc[start:idx + 1].copy()
         sections.append(section)
         start = idx + 1
 
-    # ---- 5. Process each section independently ----
+    # ---- 5. BUILD section_totals BY LEGAL ENTITY ----
+    section_totals = {}
+    for section in sections:
+        sec = section.reset_index(drop=True)
+        if len(sec) == 0:
+            continue
+
+        subtotal_row = sec.iloc[-1]
+        legal = subtotal_row["Legal Entity"].replace("Subtotal:", "").strip().upper()
+
+        gs_value = float(subtotal_row["GS Commitment"])
+        section_totals[legal] = gs_value
+
+    # ---- 6. PROCESS SECTIONS WITH CORRECT FEEDER LOGIC ----
     processed_sections = []
 
     for section in sections:
@@ -68,35 +82,40 @@ def create_commitment_sheet():
         if len(section) == 0:
             continue
 
-        subtotal_pos = len(section) - 1  # last row
-        data_rows = section.iloc[:subtotal_pos]  # all except subtotal
+        subtotal_pos = len(section) - 1
+        data_rows = section.iloc[:subtotal_pos]
 
-        # ---- IMPORTANT: compute initial GS subtotal from CDR GS only ----
-        initial_gs_subtotal = pd.to_numeric(data_rows["GS Commitment"], errors="coerce").fillna(0).sum()
+        # Extract Legal Entity for this section
+        subtotal_legal = section.iloc[-1]["Legal Entity"].replace("Subtotal:", "").strip().upper()
 
-        # ---- Update FEEDER GS Commitment ----
+        # FEEDER FIX — get correct GS subtotal for this Legal Entity
+        correct_section_gs = section_totals.get(subtotal_legal, 0)
+
+        # Identify FEEDER rows
         feeder_mask = data_rows["Bin ID"].str.upper().str.contains("FEEDER", na=False)
-        feeder_positions = data_rows.index[feeder_mask].tolist()
+        feeder_indices = data_rows.index[feeder_mask].tolist()
 
-        for pos in feeder_positions:
-            section.at[pos, "GS Commitment"] = initial_gs_subtotal
-            section.at[pos, "GS Check"] = section.at[pos, "Commitment Amount"] - initial_gs_subtotal
+        # Update FEEDER rows
+        for pos in feeder_indices:
+            section.at[pos, "GS Commitment"] = correct_section_gs
+            section.at[pos, "GS Check"] = section.at[pos, "Commitment Amount"] - correct_section_gs
 
-        # ---- Recompute FINAL subtotal after FEEDER fix ----
-        final_commit_subtotal = pd.to_numeric(section.iloc[:subtotal_pos]["Commitment Amount"], errors="coerce").fillna(0).sum()
-        final_gs_subtotal = pd.to_numeric(section.iloc[:subtotal_pos]["GS Commitment"], errors="coerce").fillna(0).sum()
+        # ---- Recompute FINAL subtotal after feeder updates ----
+        updated_data = section.iloc[:subtotal_pos]
+        final_commit_sum = pd.to_numeric(updated_data["Commitment Amount"], errors="coerce").fillna(0).sum()
+        final_gs_sum = pd.to_numeric(updated_data["GS Commitment"], errors="coerce").fillna(0).sum()
 
-        # ---- Write updated subtotal ----
-        section.at[subtotal_pos, "Commitment Amount"] = final_commit_subtotal
-        section.at[subtotal_pos, "GS Commitment"] = final_gs_subtotal
-        section.at[subtotal_pos, "GS Check"] = final_commit_subtotal - final_gs_subtotal
+        # Write final subtotal to subtotal row
+        section.at[subtotal_pos, "Commitment Amount"] = final_commit_sum
+        section.at[subtotal_pos, "GS Commitment"] = final_gs_sum
+        section.at[subtotal_pos, "GS Check"] = final_commit_sum - final_gs_sum
 
         processed_sections.append(section)
 
     # Combine processed sections
     df = pd.concat(processed_sections, ignore_index=True)
 
-    # ---- 6. SS Commitment (unchanged logic) ----
+    # ---- 7. SS Commitment (unchanged) ----
     ss_source = df.groupby("_bin_norm")["Commitment Amount"].sum().to_dict()
 
     investern = pd.read_excel(
@@ -114,16 +133,16 @@ def create_commitment_sheet():
     investern["SS Commitment"] = investern["_id_norm"].map(ss_source).fillna(0)
     investern["SS Check"] = investern["SS Commitment"] - investern["Invester Commitment"]
 
-    # ---- 7. Final combine ----
+    # ---- 8. Final combine ----
     max_rows = max(len(df), len(investern))
-    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)}, dtype=object)
+    spacer = pd.DataFrame({f"Empty_{i}": [""] * max_rows for i in range(3)})
 
     df = df.reindex(range(max_rows)).reset_index(drop=True)
     investern = investern.reindex(range(max_rows)).reset_index(drop=True)
 
     combined_df = pd.concat([df.astype(object), spacer, investern.astype(object)], axis=1)
 
-    # ---- 8. SS Total Row ----
+    # ---- 9. SS Total ----
     subtotal_row = {col: "" for col in combined_df.columns}
     subtotal_row.update({
         "Vehicle/Investor": "Subtotal (SS Total)",
@@ -134,12 +153,11 @@ def create_commitment_sheet():
 
     combined_df = pd.concat([combined_df, pd.DataFrame([subtotal_row])], ignore_index=True)
 
-    # ---- 9. Clean up ----
+    # ---- 10. Cleanup & write ----
     internal_cols = [c for c in combined_df.columns if c.startswith("_")]
     combined_df.drop(columns=internal_cols, inplace=True, errors="ignore")
     combined_df = clean_dataframe(combined_df)
 
-    # ---- 10. Write ----
     with pd.ExcelWriter(output_file, engine="openpyxl", mode="a") as writer:
         combined_df.to_excel(writer, sheet_name="Commitment Sheet", index=False)
 
